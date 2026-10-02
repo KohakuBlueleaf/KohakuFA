@@ -215,6 +215,36 @@ def features_figure(rows, out):
     plt.close(fig)
 
 
+def head_dims_figure(rows, out):
+    """Effective TFLOPS over head dim: 2 x 2 small multiples (dense / causal x fwd /
+    fwd+bwd), one line per kernel over the head dims it runs."""
+    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.8), sharex=True)
+    for c, mode in enumerate(("dense", "causal")):
+        for r, pass_ in enumerate(("fwd", "fwd+bwd")):
+            ax = axes[r, c]
+            kernels = sorted({x["kernel"] for x in rows}, key=lambda k: k.startswith("KohakuFA"))
+            for kernel in kernels:
+                pts = sorted((int(x["dim"]), float(x["tflops"])) for x in rows
+                             if x["mode"] == mode and x["kernel"] == kernel
+                             and x["pass"] == pass_ and x["tflops"])  # fmt: skip
+                if pts:
+                    xs, ys = zip(*pts)
+                    line(ax, xs, ys, kernel)
+            ax.set_xticks([64 * i for i in range(1, 9)])
+            ax.grid(True, alpha=0.3)
+            ax.set_title(f"{mode}: {pass_}", fontsize=9)
+            if c == 0:
+                ax.set_ylabel(f"{pass_}: effective TFLOPS")
+            if r == 1:
+                ax.set_xlabel("head dim D")
+            ax.legend(fontsize=7)
+    fig.suptitle("B300, fp16, 16 heads, S = 4096: effective TFLOPS by head dim (higher is better;"
+                 " a missing point: the kernel does not run that head dim)", fontsize=10)  # fmt: skip
+    fig.tight_layout()
+    fig.savefig(out / "head_dims_tflops.png", dpi=130)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", default="benchmarks/results")
@@ -232,6 +262,8 @@ def main():
         speed_figures(read(results / "speed.csv"), out)
     if (results / "features.csv").exists():
         features_figure(read(results / "features.csv"), out)
+    if (results / "head_dims.csv").exists():
+        head_dims_figure(read(results / "head_dims.csv"), out)
 
 
 if __name__ == "__main__":

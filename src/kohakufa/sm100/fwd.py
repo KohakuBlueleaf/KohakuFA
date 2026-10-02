@@ -965,9 +965,20 @@ def _rescale(k, o_tmem, HALF_INDEX: gl.constexpr, state, o_regs: gl.constexpr):
     alpha = k.smem.alpha.index(buffer).load(gl.SliceLayout(1, o_regs))
     mbarrier.arrive(bars.alpha_free.index(buffer), count=1)
     _wait_ready(bars.o_ready.index(HALF_INDEX), o_count)
-    for c in gl.static_range(k.problem.NV):  # chunk by chunk (power-of-two blocks)
-        o_c = o_tmem.index(HALF_INDEX * k.problem.NV + c)
-        o_c.store(o_c.load(o_regs) * alpha[:, None])
+    NV: gl.constexpr = k.problem.NV
+    if k.problem.HALVES == 1 and NV <= 2:
+        # one half, O up to 128 columns: the correction warps have the registers to hold
+        # all of it, so every chunk's TMEM load is in flight before the first multiply
+        # (3 to 8% at D = 128)
+        olds = ()
+        for c in gl.static_range(NV):
+            olds = olds + (o_tmem.index(c).load(o_regs),)
+        for c in gl.static_range(NV):
+            o_tmem.index(c).store(olds[c] * alpha[:, None])
+    else:  # chunk by chunk (two halves leave the correction warps ~64 registers)
+        for c in gl.static_range(NV):
+            o_c = o_tmem.index(HALF_INDEX * NV + c)
+            o_c.store(o_c.load(o_regs) * alpha[:, None])
     mbarrier.arrive(bars.o_free.index(HALF_INDEX), count=1)
     return tiles, alpha_count + 1, o_count + 1
 
@@ -1196,7 +1207,7 @@ def attention_forward(
     out = torch.empty(batch, seq_q, heads, dim, device=q.device, dtype=q.dtype)
     out = out.transpose(1, 2)
     lse = torch.empty(batch, heads, 2, seq_q, device=q.device, dtype=torch.float32)
-    cfg = forward_config(dim, q.element_size())
+    cfg = forward_config(dim, q.element_size(), block > 0, max(seq_q, seq_kv))
     rows = cfg.halves * HALF_ROWS  # query rows per CTA tile
     # 256-row tiles per head; a remainder of at most 128 rows becomes a paired tail
     remainder = seq_q % rows
@@ -1234,9 +1245,9 @@ def _constexprs(cfg) -> dict:
     }
 
 
-def forward_rows(dim: int, elem_bytes: int = 2) -> int:
+def forward_rows(dim: int, elem_bytes: int = 2, causal: bool = False) -> int:
     """Query rows per CTA tile of the forward for head dim ``dim`` (VARLEN tile tables)."""
-    return forward_config(dim, elem_bytes).halves * HALF_ROWS
+    return forward_config(dim, elem_bytes, causal).halves * HALF_ROWS
 
 
 def _no_lists(device) -> tuple:
@@ -1281,7 +1292,7 @@ def attention_forward_varlen(
     out = torch.empty_like(q)
     lse = torch.empty(1, heads, 2, total_q, device=q.device, dtype=torch.float32)
     q4, k4, v4, o4 = (t.unsqueeze(0).transpose(1, 2) for t in (q, k, v, out))
-    cfg = forward_config(dim, q.element_size())
+    cfg = forward_config(dim, q.element_size(), block > 0)
     num_tiles = tiles.shape[0] * cfg.vsplit
     grid = (min(num_tiles, _GRID_LIMIT or sm_count(q.device)),)
     attention_fwd_kernel[grid](

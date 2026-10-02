@@ -614,7 +614,8 @@ def _issue_dk_dq(k, kv_slot, step, acc):
     ds_t = sm.ds.permute((1, 0))
     if _pow2(p.HEAD_DIM):
         tcgen05_mma(sm.ds, _whole(sm.q, slot, p), tm.dk, use_acc=acc)
-        tcgen05_mma(ds_t, _whole(sm.k, kv_slot, p), tm.dq, use_acc=False, mbarriers=done)
+        dq = tm.dq.slice(0, p.HEAD_DIM)  # (ALIAS: the first D of the 128 dP^T columns)
+        tcgen05_mma(ds_t, _whole(sm.k, kv_slot, p), dq, use_acc=False, mbarriers=done)
     else:  # TMEM blocks are powers of two: one MMA per head-dim chunk
         for c in gl.static_range(p.NCH):
             q_tile = _chunk(sm.q, slot, c, p.NCH, DC)
@@ -1444,7 +1445,7 @@ def attention_backward(
     )  # fmt: skip
     stats_layout = gl.NVMMASharedLayout(0, 32, rank=1)
     stats_desc = TensorDescriptor.from_tensor(stats, [TILE_ROWS], stats_layout)
-    cfg = backward_config(dim, q.element_size())
+    cfg = backward_config(dim, q.element_size(), block > 0, max(seq_q, seq_kv))
     dq_desc = _dq_descriptor(dq_acc, cfg.reduce_cols)
 
     # Keys no query sees (block-causal with Sq < Skv: key c is first seen by query
@@ -1621,7 +1622,7 @@ def attention_backward_varlen(
     stats_desc = TensorDescriptor.from_tensor(
         stats, [TILE_ROWS], gl.NVMMASharedLayout(0, 32, rank=1)
     )
-    cfg = backward_config(dim, q.element_size())
+    cfg = backward_config(dim, q.element_size(), block > 0)
     dq_desc = _dq_descriptor(dq_acc, cfg.reduce_cols)
     dk = torch.zeros_like(k)  # keys no query sees keep 0
     dv = torch.zeros_like(v)

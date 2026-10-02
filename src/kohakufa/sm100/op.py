@@ -281,7 +281,8 @@ def attention_varlen(
     if plan is None:
         plan = varlen_plan(cu_seqlens_q, cu_seqlens_k, q.shape[1], k.shape[1], block_causal)
     tiles_256, tiles_128, *tables = plan
-    fwd_tiles = tiles_256 if forward_rows(q.shape[-1], q.element_size()) == 256 else tiles_128
+    rows = forward_rows(q.shape[-1], q.element_size(), block_causal > 0)
+    fwd_tiles = tiles_256 if rows == 256 else tiles_128
     out, _ = varlen_fwd_op(
         q, k, v, cu_seqlens_q, cu_seqlens_k, fwd_tiles, *tables, float(scale), int(block_causal)
     )

@@ -48,6 +48,9 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+kohakufa = ["sm100/tuned/*.json"]
+
 [tool.black]
 line-length = 100
 target-version = ["py313"]

@@ -110,6 +110,44 @@ sequences (`benchmarks/features.py`), each against the kernels that support it:
 The precision sweep in bf16 is in [precision_rel_err (bf16)](docs/images/precision_rel_err_j3e-2_bf16.png):
 the same picture as fp16, one step coarser.
 
+### Head dims 64 to 512
+
+Every head dim that is a multiple of 16 runs natively (others are zero-padded to one), up
+to 512, forward and backward, at the same fp64-level precision. Wide heads change how
+the work fits one SM:
+
+* **forward**: above D = 128 a CTA holds one 128-row query half (O of a 512-column head
+  would fill tensor memory alone), K / V stream through a ring of 64-column chunks, and
+  at D = 512 the output's columns are split over two CTAs (QK^T computed by both);
+* **backward**: above D = 128 a CTA owns one key tile and a <= 128-column slice of dK /
+  dV / dQ (S^T and dP^T recomputed per slice), K resident and V / Q / dO streamed.
+
+B300, fp16, 16k tokens, dense, effective TFLOPS (forward / backward):
+
+| D | 64 | 128 | 192 | 256 | 320 | 384 | 448 | 512 |
+|---|---|---|---|---|---|---|---|---|
+| KohakuFA | 1070 / 1040 | 1413 / 980 | 1454 / 621 | 1448 / 730 | 1141 / 512 | 1139 / 521 | 911 / 457 | 694 / 455 |
+| best other | FA4 1070 / 890 | FA4 1804 / 1157 | flex 377 / 234 | FA4 1431 / 906 | none runs | none | none | none |
+
+FlashAttention-4 is faster at D = 128 (its forward skips most O rescales by letting the
+row max lag, the source of its precision bug 2; its backward reduces dQ with a 1D bulk
+copy Gluon does not expose) and in the D = 256 backward (2-CTA MMAs); see
+[docs/performance-notes.md](docs/performance-notes.md). FA4 / cuDNN / FA2 do not run
+D = 192 or D >= 320 on B300, and flex attention crashes there.
+
+### Block sizes: planned, then timed
+
+Each kernel has many legal configurations (key-tile width, S-ring depth, query halves,
+value split, K / V ring depth, buffering, register split). `sm100/plan.py` scores every
+legal one with a cost model calibrated from in-kernel clock traces (tensor-core,
+shared-memory, MUFU, softmax, L2 and dQ-reduce terms, recomputation, waves);
+`sm100/tune.py` times the best candidates of each structural family on the card,
+interleaved, and keeps the winner per (architecture, head dim, masking, sequence-length
+bucket). The tables tuned on B300 ship in `sm100/tuned/`; other shapes and cards use the
+planner's best prediction. `python benchmarks/tune.py` re-tunes;
+`kohakufa/device.py` describes a card and maps an architecture to its kernels (sm_120
+plugs in there).
+
 ## Production case: how the bugs were found
 
 KohakuFA started inside a video-representation project that fine-tunes a pretrained **DINOv3**

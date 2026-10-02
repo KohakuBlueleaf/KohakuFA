@@ -110,27 +110,23 @@ def _ring_depths(dc, nch, block_n, s_slots, q_bufs, group, halves, vsplit, out_b
     yield from {c for c in legal[:1] + capped[:1]}
 
 
-# Measured best per head dim on B300 (16-bit operands, 16k tokens, dense; the heuristic
-# below covers the other head dims)
-FORWARD_TUNED = {
-    128: ForwardConfig(64, 2, 128, 3, 1, 5, 2, halves=1, vsplit=1, out_bufs=1),
-    192: ForwardConfig(64, 3, 128, 2, 1, 2, 3, halves=1, vsplit=1, out_bufs=2),
-    256: ForwardConfig(64, 4, 128, 2, 1, 4, 2, halves=1, vsplit=1, out_bufs=1),
-    320: ForwardConfig(64, 5, 64, 3, 1, 3, 5, halves=1, vsplit=1, out_bufs=1),
-    384: ForwardConfig(64, 6, 64, 2, 1, 6, 2, halves=1, vsplit=1, out_bufs=1),
-    448: ForwardConfig(64, 7, 64, 1, 1, 9, 1, halves=1, vsplit=1, out_bufs=2),
-    512: ForwardConfig(64, 8, 64, 2, 1, 9, 1, halves=1, vsplit=2, out_bufs=1),
-}
+def forward_config(
+    head_dim: int, elem_bytes: int = 2, causal: bool = False, seq: int = 0
+) -> ForwardConfig:
+    """The forward configuration: the tuned table's entry for this card, head dim,
+    masking and sequence-length bucket (``tune.py``), else the planner's best prediction
+    (``plan.py``), else ``heuristic_forward``. ``seq``: the longer of the query / key
+    lengths (0: unknown, the long bucket)."""
+    return _choose("forward", head_dim, elem_bytes, causal, bucket(seq)) or heuristic_forward(
+        head_dim, elem_bytes
+    )
 
 
-def forward_config(head_dim: int, elem_bytes: int = 2) -> ForwardConfig:
+def heuristic_forward(head_dim: int, elem_bytes: int = 2) -> ForwardConfig:
     """Default: an S ring of at least two (QK^T ahead of P V), least recomputation (no
     value split), two halves, the widest head-dim chunk, a K / V ring of at least three
     tiles, 128-key tiles, then deeper S ring, Q double buffering, output staging,
     whole-tile ring slots and the deepest ring up to 6 tiles."""
-    tuned = FORWARD_TUNED.get(head_dim)
-    if tuned is not None and elem_bytes == 2:
-        return tuned
     configs = list(forward_configs(head_dim, elem_bytes))
     if not configs:
         raise ValueError(f"head dim {head_dim}: no forward configuration fits one SM")
@@ -215,7 +211,11 @@ class BackwardConfig:
             return False
         if self.stream and not (self.alias and self.nsl * self.nw >= self.nch):
             return False
-        slots_ok = self.do_slots >= 1 if self.stream else 1 <= self.do_slots <= self.q_slots
+        # S^T(i + 1) is issued before dK(i) releases Q(i)'s slot: one Q slot deadlocks
+        q_ok = self.q_slots >= 2 or self.stream
+        slots_ok = (
+            self.do_slots >= 1 if self.stream else 1 <= self.do_slots <= self.q_slots
+        ) and q_ok
         return (
             self.tmem_columns() <= TMEM_COLUMNS
             and self.smem_bytes(elem_bytes) <= SMEM_BYTES
@@ -268,8 +268,55 @@ def _stream_configs(head_dim: int, elem_bytes: int):
     )
 
 
-def backward_config(head_dim: int, elem_bytes: int = 2) -> BackwardConfig:
-    """Default backward configuration (the first legal one, see ``backward_configs``)."""
+def backward_config(
+    head_dim: int, elem_bytes: int = 2, causal: bool = False, seq: int = 0
+) -> BackwardConfig:
+    """The backward configuration: tuned table, else planner, else ``heuristic_backward``."""
+    return _choose("backward", head_dim, elem_bytes, causal, bucket(seq)) or heuristic_backward(
+        head_dim, elem_bytes
+    )
+
+
+def heuristic_backward(head_dim: int, elem_bytes: int = 2) -> BackwardConfig:
+    """The first legal configuration in ``backward_configs`` order."""
     for cfg in backward_configs(head_dim, elem_bytes):
         return cfg
     raise ValueError(f"head dim {head_dim}: no backward configuration fits one SM")
+
+
+_CHOSEN: dict[tuple, object] = {}
+BUCKETS = (("s512", 512), ("s2048", 2048))  # tuned length buckets (beyond: "long")
+
+
+def bucket(seq: int) -> str:
+    """The tuned length bucket of a call whose longer sequence has ``seq`` tokens."""
+    for name, limit in BUCKETS:
+        if 0 < seq <= limit:
+            return name
+    return "long"
+
+
+def _choose(kind: str, head_dim: int, elem_bytes: int, causal: bool, length: str):
+    """Tuned table entry for the current card, else the planner's best prediction
+    (memoized; None without a CUDA device)."""
+    k = (kind, head_dim, elem_bytes, causal, length)
+    if k not in _CHOSEN:
+        _CHOSEN[k] = _tuned_or_planned(kind, head_dim, elem_bytes, causal, length)
+    return _CHOSEN[k]
+
+
+def _tuned_or_planned(kind, head_dim, elem_bytes, causal, length):
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    from kohakufa.device import Device
+    from kohakufa.sm100 import plan, tune
+
+    dev = Device.query()
+    found = tune.lookup(dev.arch, kind, head_dim, elem_bytes, causal, length)
+    if found is not None:
+        return found
+    seq = {"s512": 256, "s2048": 1024}.get(length, 8192)
+    shape = plan.Shape(32 * 8192 // seq, seq, seq, head_dim, causal)
+    return plan.plan_topk(kind, shape, dev, elem_bytes, topk=1)[0].config
