@@ -88,6 +88,27 @@ B300, fp16, head dim 64, 16 heads, 32k tokens per call, timed inside CUDA graphs
   flex attention up to 1.8x. FA4's `mask_mod` + block-sparsity path is not shown: its forward is
   correct but its backward is wrong (dQ / dK / dV relative error 1.4 to 3.0).
 
+### Beyond fp16 dense / causal
+
+bf16, grouped-query attention, a key-padding boolean mask and packed variable-length
+sequences (`benchmarks/features.py`), each against the kernels that support it:
+
+![feature speed](docs/images/features_tflops.png)
+
+* **bf16:** dense on par with FA4 / cuDNN; token causal 5 to 20% behind at long lengths (the
+  same diagonal-tile gap as fp16).
+* **GQA (16 query / 4 K-V heads):** fastest fwd+bwd up to 2k (600 vs 500 TFLOPS at 512), on par
+  with FA4 beyond.
+* **Varlen:** faster than FA4's varlen forward at every length (1030 vs 855 TFLOPS at 8k);
+  fwd+bwd ahead up to 4k and ~6% behind at 16k.
+* **Boolean mask: slow today.** v1 runs every key tile on the masked path and skips nothing,
+  so a key-padding mask runs at ~75 TFLOPS forward against ~390 for flex attention's block
+  mask. Tile classification (skip hidden tiles, unmasked path for fully visible ones) is the
+  next item; for padding, `attention_varlen` on the packed sequences is the fast path today.
+
+The precision sweep in bf16 is in [precision_rel_err (bf16)](docs/images/precision_rel_err_j3e-2_bf16.png):
+the same picture as fp16, one step coarser.
+
 ## Production case: how the bugs were found
 
 KohakuFA started inside a video-representation project that fine-tunes a pretrained **DINOv3**

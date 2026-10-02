@@ -16,6 +16,10 @@ import torch  # noqa: E402
 
 STYLE = {  # kernel -> (color, marker); KohakuFA drawn on top
     "KohakuFA": ("#d62728", "o"),
+    "KohakuFA (mask)": ("#d62728", "o"),
+    "KohakuFA (varlen)": ("#8b0000", "*"),
+    "FA4 (varlen)": ("#9467bd", "D"),
+    "SDPA (enable_gqa)": ("#17becf", "s"),
     "FA2 (SDPA flash)": ("#1f77b4", "s"),
     "FA4": ("#9467bd", "D"),
     "cuDNN (SDPA)": ("#2ca02c", "^"),
@@ -178,6 +182,39 @@ def speed_figures(rows, out):
         plt.close(fig)
 
 
+def features_figure(rows, out):
+    benches = list(dict.fromkeys(r["bench"] for r in rows))
+    titles = {"bf16 dense": "bf16, dense", "bf16 causal": "bf16, token causal",
+              "gqa 16/4": "GQA, 16 query / 4 K-V heads (fp16)",
+              "key padding": "key padding, 50-100% kept (fp16)",
+              "varlen": "varlen, packed lengths in [S/4, S] (fp16)"}  # fmt: skip
+    fig, axes = plt.subplots(2, len(benches), figsize=(4.3 * len(benches), 7.8), sharex=True)
+    for c, bench in enumerate(benches):
+        for r, pass_ in enumerate(("fwd", "fwd+bwd")):
+            ax = axes[r, c]
+            kernels = sorted({x["kernel"] for x in rows if x["bench"] == bench},
+                             key=lambda k: k.startswith("KohakuFA"))  # fmt: skip
+            for kernel in kernels:
+                pts = sorted((int(x["seq"]), float(x["tflops"])) for x in rows
+                             if x["bench"] == bench and x["kernel"] == kernel
+                             and x["pass"] == pass_ and x["graph"] == "True")  # fmt: skip
+                if pts:
+                    xs, ys = zip(*pts)
+                    line(ax, xs, ys, kernel)
+            ax.set_xscale("log", base=2)
+            ax.grid(True, alpha=0.3)
+            ax.set_title(f"{titles.get(bench, bench)}: {pass_}", fontsize=9)
+            if c == 0:
+                ax.set_ylabel(f"{pass_}: effective TFLOPS")
+            if r == 1:
+                ax.set_xlabel("sequence length S")
+            ax.legend(fontsize=7)
+    fig.suptitle("B300: effective TFLOPS (visible FLOPs only), higher is better")
+    fig.tight_layout()
+    fig.savefig(out / "features_tflops.png", dpi=130)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", default="benchmarks/results")
@@ -193,6 +230,8 @@ def main():
             violin_figure(torch.load(rows_path), out, tag)
     if (results / "speed.csv").exists():
         speed_figures(read(results / "speed.csv"), out)
+    if (results / "features.csv").exists():
+        features_figure(read(results / "features.csv"), out)
 
 
 if __name__ == "__main__":

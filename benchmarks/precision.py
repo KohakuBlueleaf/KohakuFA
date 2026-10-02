@@ -24,7 +24,9 @@ from kernels import KERNELS
 TENSORS = ("out", "dq", "dk", "dv")
 
 
-def make_inputs(scale, batch=2, heads=8, seq=1024, dim=64, clusters=16, jitter=1e-3, seed=0):
+def make_inputs(
+    scale, batch=2, heads=8, seq=1024, dim=64, clusters=16, jitter=1e-3, seed=0, dtype=torch.half
+):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     centers = torch.randn(batch, heads, clusters, dim, device="cuda", generator=gen)
     centers = centers / centers.norm(dim=-1, keepdim=True)
@@ -34,11 +36,11 @@ def make_inputs(scale, batch=2, heads=8, seq=1024, dim=64, clusters=16, jitter=1
 
     def around(t):
         noisy = t + jitter * torch.randn(t.shape, device="cuda", generator=gen)
-        return (radius * noisy).half()
+        return (radius * noisy).to(dtype)
 
     q, k = around(base), around(base)
-    v = torch.randn(base.shape, device="cuda", generator=gen).half()
-    dout = torch.randn(base.shape, device="cuda", generator=gen).half()
+    v = torch.randn(base.shape, device="cuda", generator=gen).to(dtype)
+    dout = torch.randn(base.shape, device="cuda", generator=gen).to(dtype)
     return q, k, v, dout
 
 
@@ -90,6 +92,7 @@ def main():
     parser.add_argument("--violin-scales", default="1e2,1e5,1e7")
     parser.add_argument("--jitter", type=float, default=1e-3, help="key spread within a cluster")
     parser.add_argument("--tag", default="", help="suffix of the output files")
+    parser.add_argument("--dtype", default="fp16", choices=("fp16", "bf16"))
     args = parser.parse_args()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -99,7 +102,8 @@ def main():
     rows, per_row = [], {}
     for mode in ("dense", "causal"):
         for scale in scales:
-            q, k, v, dout = make_inputs(scale, jitter=args.jitter)
+            dtype = {"fp16": torch.half, "bf16": torch.bfloat16}[args.dtype]
+            q, k, v, dout = make_inputs(scale, jitter=args.jitter, dtype=dtype)
             want = reference(q, k, v, dout, mode)
             for name, (fn, modes) in KERNELS.items():
                 if mode not in modes or name == "flex":
