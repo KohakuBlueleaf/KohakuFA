@@ -5,7 +5,7 @@ from torch import Tensor
 
 from kohakufa.sm100.op import attention as _sm100_attention
 
-COMPUTE_DTYPES = (torch.float16,)
+COMPUTE_DTYPES = (torch.float16, torch.bfloat16)
 
 
 def attention(
@@ -21,7 +21,9 @@ def attention(
     """``softmax(scale q k^T) v``.
 
     Args:
-        q: ``[B, H, Sq, D]``; k, v: ``[B, H, Skv, D]``. Views of ``[B, S, H, D]``
+        q: ``[B, H, Sq, D]``; k, v: ``[B, Hkv, Skv, D]`` with ``H`` a multiple of ``Hkv``
+            (grouped-query attention: query head ``h`` uses K / V head ``h // (H / Hkv)``;
+            ``Hkv = 1`` is multi-query). Views of ``[B, S, H, D]``
             projections are fine (any strides, contiguous last dim, 16-byte aligned).
         causal: query ``r`` sees keys ``0..r`` (top-left aligned when ``Sq != Skv``).
         block_causal: frame size ``P > 0``: query ``r`` sees keys of frames up to its

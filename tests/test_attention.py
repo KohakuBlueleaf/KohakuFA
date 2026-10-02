@@ -158,3 +158,51 @@ def test_huge_logits(causal):
     want = reference(q, k, v, dout, 64**-0.5, block=1 if causal else 0)
     for name, g, w, bound in zip(("dk", "dv"), got[2:], want[2:], (0.995, 0.9999)):
         assert metrics(g, w)["cos"] > bound, name
+
+
+BF16_TOL = 2e-2  # 8-bit mantissa: P, dS and the outputs round ~16x coarser than fp16
+
+
+@pytest.mark.parametrize(
+    "shape,mode",
+    [
+        ((2, 3, 269, 269), "dense"),
+        ((1, 2, 1000, 1000), "causal"),
+        ((2, 3, 600, 600), "block"),
+        ((2, 2, 131, 517), "dense"),
+        ((1, 2, 300, 517), "causal"),
+    ],
+    ids=str,
+)
+def test_bf16(shape, mode):
+    q, k, v, dout = inputs(*shape, dtype=torch.bfloat16)
+    kwargs = {"dense": {}, "causal": {"causal": True}, "block": {"block_causal": 24}}[mode]
+    block = {"dense": 0, "causal": 1, "block": 24}[mode]
+    got = run(q, k, v, dout, **kwargs)
+    assert got[0].dtype == torch.bfloat16
+    check(got, reference(q, k, v, dout, 64**-0.5, block=block), tol=BF16_TOL)
+
+
+@pytest.mark.parametrize(
+    "heads,kv_heads,shape,mode,dtype",
+    [
+        (8, 4, (2, 269), "dense", torch.float16),
+        (8, 2, (1, 1000), "causal", torch.float16),
+        (8, 1, (2, 600), "block", torch.float16),
+        (16, 4, (2, 1799), "dense", torch.float16),
+        (6, 2, (1, 300), "causal", torch.bfloat16),
+        (8, 1, (2, 131), "dense", torch.bfloat16),
+    ],
+    ids=str,
+)
+def test_gqa(heads, kv_heads, shape, mode, dtype):
+    """Grouped-query (and multi-query, kv_heads = 1) attention: dK / dV are summed over
+    each K / V head's query heads."""
+    batch, seq = shape
+    q, k, v, dout = inputs(batch, heads, seq, seq, dtype=dtype, kv_heads=kv_heads)
+    kwargs = {"dense": {}, "causal": {"causal": True}, "block": {"block_causal": 24}}[mode]
+    block = {"dense": 0, "causal": 1, "block": 24}[mode]
+    got = run(q, k, v, dout, **kwargs)
+    assert got[2].shape == k.shape and got[3].shape == v.shape
+    want = reference(q, k, v, dout, 64**-0.5, block=block, groups=heads // kv_heads)
+    check(got, want, tol=TOL if dtype == torch.float16 else BF16_TOL)

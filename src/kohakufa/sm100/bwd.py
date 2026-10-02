@@ -77,7 +77,8 @@ CHUNK = gl.constexpr(32)  # score columns a compute thread holds at once
 @aggregate
 class Problem:
     qk_scale: gl.tensor  # softmax scale * log2(e)
-    heads: gl.tensor
+    heads: gl.tensor  # query heads
+    group: gl.tensor  # query heads per K / V head (GQA; 1 = multi-head)
     seq_q: gl.tensor
     seq_kv: gl.tensor
     block: gl.tensor  # block-causal block size (unused when not CAUSAL)
@@ -88,11 +89,12 @@ class Problem:
 
     @gluon.constexpr_function
     def __init__(
-        self, qk_scale, heads, seq_q, seq_kv, block, num_kv_tiles, num_tiles,
+        self, qk_scale, heads, group, seq_q, seq_kv, block, num_kv_tiles, num_tiles,
         HEAD_DIM, CAUSAL,
     ):  # fmt: skip
         self.qk_scale = qk_scale
         self.heads = heads
+        self.group = group
         self.seq_q = seq_q
         self.seq_kv = seq_kv
         self.block = block
@@ -115,7 +117,7 @@ class Problem:
         # a head's key tiles are consecutive: CTAs running together share its Q / dO
         # in L2 (block-causal: within a head, the longest key tiles come first)
         kv_tile = tile_id % self.num_kv_tiles
-        batch_head = tile_id // self.num_kv_tiles
+        batch_kv_head = tile_id // self.num_kv_tiles  # batch * kv_heads + kv_head
         kv_start = kv_tile * TILE
         num_q_tiles = gl.cdiv(self.seq_q, TILE)
         if self.CAUSAL:
@@ -129,25 +131,29 @@ class Problem:
         else:
             first_q = kv_start * 0
             first_full = first_q
-        return TileInfo(batch_head // self.heads, batch_head % self.heads, batch_head,
+        kv_heads = self.heads // self.group
+        return TileInfo(batch_kv_head // kv_heads, batch_kv_head % kv_heads,
                         kv_start, first_q, first_full, num_q_tiles)  # fmt: skip
+
+    @gluon.jit
+    def q_head(self, info, g):
+        """Query head ``g`` (0 .. group - 1) of the tile's K / V head."""
+        return info.head * self.group + g
 
 
 @aggregate
 class TileInfo:
     batch: gl.tensor
-    head: gl.tensor
-    batch_head: gl.tensor
+    head: gl.tensor  # the K / V head (query heads head * group .. + group - 1)
     kv_start: gl.tensor
     first_q: gl.tensor  # first query tile visited
     first_full: gl.tensor  # first query tile computed without a mask
     end_q: gl.tensor  # one past the last query tile
 
     @gluon.constexpr_function
-    def __init__(self, batch, head, batch_head, kv_start, first_q, first_full, end_q):
+    def __init__(self, batch, head, kv_start, first_q, first_full, end_q):
         self.batch = batch
         self.head = head
-        self.batch_head = batch_head
         self.kv_start = kv_start
         self.first_q = first_q
         self.first_full = first_full
@@ -314,21 +320,24 @@ def _load_partition(k):
         tma.async_copy_global_to_shared(k.k_desc, coords, ready, sm.k.index(kv_slot))
         tma.async_copy_global_to_shared(k.v_desc, coords, ready, sm.v.index(kv_slot))
         tiles += 1  # noqa: SIM113 (Gluon has no enumerate)
-        for i in range(info.first_q, info.end_q):
-            slot = steps % QDO_SLOTS
-            _wait_free(bars.qdo_free.index(slot), steps // QDO_SLOTS)
-            ready = bars.qdo_ready.index(slot)
-            mbarrier.expect(ready, qdo_bytes)
-            coords = [info.batch, info.head, i * TILE, 0]
-            tma.async_copy_global_to_shared(k.q_desc, coords, ready, sm.q.index(slot))
-            tma.async_copy_global_to_shared(k.do_desc, coords, ready, sm.do.index(slot))
-            stats_at = (info.batch_head * num_q_tiles + i) * STATS * TILE
-            for which in gl.static_range(STATS):
-                tma.async_copy_global_to_shared(
-                    k.stats_desc, [stats_at + which * TILE], ready,
-                    sm.stats.index(STATS * slot + which),
-                )  # fmt: skip
-            steps += 1
+        for g in range(p.group):
+            q_head = p.q_head(info, g)
+            for i in range(info.first_q, info.end_q):
+                slot = steps % QDO_SLOTS
+                _wait_free(bars.qdo_free.index(slot), steps // QDO_SLOTS)
+                ready = bars.qdo_ready.index(slot)
+                mbarrier.expect(ready, qdo_bytes)
+                coords = [info.batch, q_head, i * TILE, 0]
+                tma.async_copy_global_to_shared(k.q_desc, coords, ready, sm.q.index(slot))
+                tma.async_copy_global_to_shared(k.do_desc, coords, ready, sm.do.index(slot))
+                stats_row = (info.batch * p.heads + q_head) * num_q_tiles + i
+                stats_at = stats_row * STATS * TILE
+                for which in gl.static_range(STATS):
+                    tma.async_copy_global_to_shared(
+                        k.stats_desc, [stats_at + which * TILE], ready,
+                        sm.stats.index(STATS * slot + which),
+                    )  # fmt: skip
+                steps += 1
 
 
 # --------------------------------------------------------------------------------------
@@ -373,7 +382,7 @@ def _mma_partition(k):
     dq_count = 0
     for tile_id in range(gl.program_id(0), p.num_tiles, gl.num_programs(0)):
         info = p.tile(tile_id)
-        n = info.end_q - info.first_q
+        n = (info.end_q - info.first_q) * p.group  # every query head of the K / V head
         kv_slot = tiles & 1
         _wait_ready(bars.kv_ready.index(kv_slot), tiles // 2)
         _issue_s(k, kv_slot, steps)
@@ -446,8 +455,9 @@ def _p_partition(k):
         masked_end = info.first_full
         if info.kv_start + TILE > p.seq_kv:
             masked_end = info.end_q
-        steps = _p_steps(k, first_query, info.first_q, masked_end, steps, regs, True)
-        steps = _p_steps(k, first_query, masked_end, info.end_q, steps, regs, False)
+        for g in range(p.group):  # the same keys for every query head of the group
+            steps = _p_steps(k, first_query, info.first_q, masked_end, steps, regs, True)
+            steps = _p_steps(k, first_query, masked_end, info.end_q, steps, regs, False)
 
 
 @gluon.jit
@@ -475,7 +485,7 @@ def _p_steps(k, first_query, start, end, steps, regs: gl.constexpr, MASKED: gl.c
                 queries = i * TILE + c * CHUNK + offsets
                 visible = queries[None, :] >= first_query[:, None]
                 prob = gl.where(visible, prob, 0.0)
-            probs = probs + (prob.to(gl.float16),)
+            probs = probs + (prob.to(k.q_desc.block_type.element_ty),)
         _wait_free(bars.p_read.index(0), steps)  # the dS warpgroup read P^T(i - 1)
         tm.p.store(_join_columns(probs))
         mbarrier.arrive(bars.p_ready.index(0), count=1)
@@ -492,13 +502,13 @@ def _ds_partition(k):
     chunk_tmem: gl.constexpr = TensorMemoryLayout([TILE, CHUNK], col_stride=1)
     regs: gl.constexpr = get_tmem_reg_layout(gl.float32, [TILE, CHUNK], chunk_tmem, gl.num_warps())
     p_regs: gl.constexpr = get_tmem_reg_layout(
-        gl.float16, [TILE, CHUNK], chunk_tmem, gl.num_warps()
+        k.q_desc.block_type.element_ty, [TILE, CHUNK], chunk_tmem, gl.num_warps()
     )
     col_layout: gl.constexpr = gl.SliceLayout(0, regs)
     steps = 0
     for tile_id in range(gl.program_id(0), p.num_tiles, gl.num_programs(0)):
         info = p.tile(tile_id)
-        for i in range(info.first_q, info.end_q):
+        for _ in range((info.end_q - info.first_q) * p.group):  # every query head's steps
             neg_delta = sm.stats.index(STATS * (steps % QDO_SLOTS) + 2)
             # all of dP^T(i) to registers first: its TMEM slot is free for dP^T(i + 1)
             _wait_ready(bars.dp_ready.index(0), steps)
@@ -515,7 +525,7 @@ def _ds_partition(k):
                 delta = neg_delta.slice(c * CHUNK, CHUNK).load(col_layout)
                 delta2 = float2.pack(delta[None, :].broadcast_to([TILE, CHUNK]), axis=1)
                 ds2 = (float2.pack(dps[c], axis=1) + delta2) * float2.pack(prob, axis=1)
-                ds = float2.unpack(ds2, axis=1).to(gl.float16)
+                ds = float2.unpack(ds2, axis=1).to(k.q_desc.block_type.element_ty)
                 sm.ds.slice(c * CHUNK, CHUNK, dim=1).store(ds)
             mbarrier.arrive(bars.p_read.index(0), count=1)
             fence_async_shared()
@@ -543,22 +553,24 @@ def _reduce_partition(k):
     acc_tmem: gl.constexpr = TensorMemoryLayout([TILE, D], col_stride=1)
     regs: gl.constexpr = get_tmem_reg_layout(gl.float32, [TILE, D], acc_tmem, gl.num_warps())
     # the staging buffer seen as one fp16 [TILE, D] box for the dK / dV stores
-    out16 = sm.out._reinterpret(gl.float16, [1, 1, TILE, D], k.dk_desc.layout)
+    out16 = sm.out._reinterpret(k.dk_desc.block_type.element_ty, [1, 1, TILE, D], k.dk_desc.layout)
     tiles = 0
     dq_count = 0
     scale = p.qk_scale / 1.4426950408889634
     for tile_id in range(gl.program_id(0), p.num_tiles, gl.num_programs(0)):
         info = p.tile(tile_id)
-        for i in range(info.first_q, info.end_q):
-            _wait_ready(bars.dq_ready.index(0), dq_count)
-            dq_lo = tm.dq.slice(0, HALF_D).load(half_regs)
-            dq_hi = tm.dq.slice(HALF_D, HALF_D).load(half_regs)
-            mbarrier.arrive(bars.dq_free.index(0), count=1)
-            dq_count += 1
-            coords = [info.batch, info.head, i * TILE, 0]
-            _stage_reduce(k, dq_lo, coords)
-            coords = [info.batch, info.head, i * TILE, HALF_D]
-            _stage_reduce(k, dq_hi, coords)
+        for g in range(p.group):
+            q_head = p.q_head(info, g)
+            for i in range(info.first_q, info.end_q):
+                _wait_ready(bars.dq_ready.index(0), dq_count)
+                dq_lo = tm.dq.slice(0, HALF_D).load(half_regs)
+                dq_hi = tm.dq.slice(HALF_D, HALF_D).load(half_regs)
+                mbarrier.arrive(bars.dq_free.index(0), count=1)
+                dq_count += 1
+                coords = [info.batch, q_head, i * TILE, 0]
+                _stage_reduce(k, dq_lo, coords)
+                coords = [info.batch, q_head, i * TILE, HALF_D]
+                _stage_reduce(k, dq_hi, coords)
 
         _wait_ready(bars.dkv_ready.index(0), tiles)
         dv = tm.dv.load(regs)
@@ -567,11 +579,11 @@ def _reduce_partition(k):
         tiles += 1  # noqa: SIM113 (Gluon has no enumerate)
         coords = [info.batch, info.head, info.kv_start, 0]
         tma.store_wait(pendings=0)
-        _matrix(out16, TILE, D).store(dv.to(gl.float16))
+        _matrix(out16, TILE, D).store(dv.to(k.dk_desc.block_type.element_ty))
         fence_async_shared()
         tma.async_copy_shared_to_global(k.dv_desc, coords, out16)
         tma.store_wait(pendings=0)
-        _matrix(out16, TILE, D).store((dk * scale).to(gl.float16))
+        _matrix(out16, TILE, D).store((dk * scale).to(k.dk_desc.block_type.element_ty))
         fence_async_shared()
         tma.async_copy_shared_to_global(k.dk_desc, coords, out16)
     tma.store_wait(pendings=0)
@@ -611,23 +623,25 @@ def _barriers(n: gl.constexpr, count: gl.constexpr = 1):
 
 @gluon.jit
 def attention_bwd_kernel(
-    q_desc, k_desc, v_desc, do_desc, dk_desc, dv_desc, stats_desc, dq_desc, qk_scale, heads, seq_q, seq_kv, block, num_kv_tiles, num_tiles,
+    q_desc, k_desc, v_desc, do_desc, dk_desc, dv_desc, stats_desc, dq_desc, qk_scale, heads, group, seq_q, seq_kv, block, num_kv_tiles, num_tiles,
     HEAD_DIM: gl.constexpr, CAUSAL: gl.constexpr,
 ):  # fmt: skip
     problem = Problem(
-        gl.to_tensor(qk_scale), gl.to_tensor(heads), gl.to_tensor(seq_q),
+        gl.to_tensor(qk_scale), gl.to_tensor(heads), gl.to_tensor(group),
+        gl.to_tensor(seq_q),
         gl.to_tensor(seq_kv), gl.to_tensor(block), gl.to_tensor(num_kv_tiles),
         gl.to_tensor(num_tiles), HEAD_DIM, CAUSAL,
     )  # fmt: skip
     box: gl.constexpr = [1, 1, TILE, HEAD_DIM]
     # 64-byte swizzle: compute threads store dS^T in 32-column slices
     ds_layout: gl.constexpr = gl.NVMMASharedLayout(64, 16, rank=2)
+    dtype: gl.constexpr = q_desc.block_type.element_ty  # fp16 or bf16 operands
     smem = Smem(
-        gl.allocate_shared_memory(gl.float16, [2] + box, k_desc.layout),
-        gl.allocate_shared_memory(gl.float16, [2] + box, v_desc.layout),
-        gl.allocate_shared_memory(gl.float16, [QDO_SLOTS] + box, q_desc.layout),
-        gl.allocate_shared_memory(gl.float16, [QDO_SLOTS] + box, do_desc.layout),
-        gl.allocate_shared_memory(gl.float16, [TILE, TILE], ds_layout),
+        gl.allocate_shared_memory(dtype, [2] + box, k_desc.layout),
+        gl.allocate_shared_memory(dtype, [2] + box, v_desc.layout),
+        gl.allocate_shared_memory(dtype, [QDO_SLOTS] + box, q_desc.layout),
+        gl.allocate_shared_memory(dtype, [QDO_SLOTS] + box, do_desc.layout),
+        gl.allocate_shared_memory(dtype, [TILE, TILE], ds_layout),
         gl.allocate_shared_memory(gl.float32, [1, 1, TILE, HEAD_DIM // 2], dq_desc.layout),
         gl.allocate_shared_memory(gl.float32, [STATS * QDO_SLOTS, TILE], stats_desc.layout),
     )
@@ -642,7 +656,7 @@ def attention_bwd_kernel(
     acc: gl.constexpr = TensorMemoryLayout([TILE, HEAD_DIM], col_stride=1)
     s_tmem = allocate_tensor_memory(gl.float32, [TILE, TILE], scores)
     dp_tmem = allocate_tensor_memory(gl.float32, [TILE, TILE], scores)
-    p_tmem = allocate_tensor_memory(gl.float16, [TILE, TILE], scores)
+    p_tmem = allocate_tensor_memory(dtype, [TILE, TILE], scores)
     tmem = Tmem(
         s_tmem, dp_tmem, p_tmem,
         allocate_tensor_memory(gl.float32, [TILE, HEAD_DIM], acc),
@@ -721,7 +735,7 @@ def _dq_convert_kernel(
     off = b * stride_b + h * stride_h + s * stride_s
     tl.store(
         dq_ptr + off[:, None] + cols[None, :],
-        (acc * scale).to(tl.float16),
+        (acc * scale).to(dq_ptr.dtype.element_ty),
         mask=valid[:, None],
     )
 
@@ -768,17 +782,19 @@ def attention_backward(
     # tile with no query step would never signal its dK / dV).
     seen_kv = seq_kv if block == 0 else min(seq_kv, ((seq_q - 1) // block + 1) * block)
     alloc = torch.empty if seen_kv == seq_kv else torch.zeros
-    dk = alloc(batch, seq_kv, heads, dim, device=device, dtype=q.dtype)
-    dv = alloc(batch, seq_kv, heads, dim, device=device, dtype=q.dtype)
+    kv_heads = k.shape[1]  # GQA: dK / dV per K / V head, summed over its query heads
+    dk = alloc(batch, seq_kv, kv_heads, dim, device=device, dtype=q.dtype)
+    dv = alloc(batch, seq_kv, kv_heads, dim, device=device, dtype=q.dtype)
     dk, dv = dk.transpose(1, 2), dv.transpose(1, 2)
     num_kv_tiles = triton.cdiv(seen_kv, TILE_ROWS)
-    num_tiles = batch * heads * num_kv_tiles
+    num_tiles = batch * kv_heads * num_kv_tiles
     grid = (min(num_tiles, sm_count(device)),)
     attention_bwd_kernel[grid](
         tma_descriptor(q, TILE_ROWS), tma_descriptor(k, TILE_ROWS),
         tma_descriptor(v, TILE_ROWS), tma_descriptor(dout, TILE_ROWS),
         tma_descriptor(dk, TILE_ROWS), tma_descriptor(dv, TILE_ROWS),
-        stats_desc, dq_desc, scale * LOG2E, heads, seq_q, seq_kv, max(block, 1),
+        stats_desc, dq_desc, scale * LOG2E, heads, heads // kv_heads, seq_q, seq_kv,
+        max(block, 1),
         num_kv_tiles, num_tiles, HEAD_DIM=dim, CAUSAL=block > 0, num_warps=4,
     )  # fmt: skip
 

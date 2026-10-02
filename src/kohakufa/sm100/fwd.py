@@ -82,7 +82,8 @@ class Problem:
     K / V), so both softmax partitions always have work."""
 
     qk_scale: gl.tensor  # softmax scale * log2(e): scores in the exp2 domain
-    heads: gl.tensor
+    heads: gl.tensor  # query heads
+    group: gl.tensor  # query heads per K / V head (GQA; 1 = multi-head)
     batch_heads: gl.tensor
     seq_q: gl.tensor
     seq_kv: gl.tensor
@@ -97,11 +98,12 @@ class Problem:
 
     @gluon.constexpr_function
     def __init__(
-        self, qk_scale, heads, batch_heads, seq_q, seq_kv, block, num_full, num_pairs,
-        num_tiles, BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL,
+        self, qk_scale, heads, group, batch_heads, seq_q, seq_kv, block, num_full,
+        num_pairs, num_tiles, BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL,
     ):  # fmt: skip
         self.qk_scale = qk_scale
         self.heads = heads
+        self.group = group
         self.batch_heads = batch_heads
         self.seq_q = seq_q
         self.seq_kv = seq_kv
@@ -422,10 +424,10 @@ def _join_columns(parts):
 
 
 @gluon.jit
-def _p_view(s_slot, BN: gl.constexpr):
-    """P (fp16, [HALF, BN]) aliasing the first BN / 2 columns of an S slot."""
+def _p_view(s_slot, BN: gl.constexpr, dtype: gl.constexpr):
+    """P (16-bit ``dtype``, [HALF, BN]) aliasing the first BN / 2 columns of an S slot."""
     layout: gl.constexpr = TensorMemoryLayout([HALF, BN], col_stride=1)
-    return s_slot.slice(0, BN // 2)._reinterpret(gl.float16, [HALF, BN], layout)
+    return s_slot.slice(0, BN // 2)._reinterpret(dtype, [HALF, BN], layout)
 
 
 # --------------------------------------------------------------------------------------
@@ -478,7 +480,8 @@ def _load_kv(k, desc, cur, kv_count):
     ready = k.bars.kv_ready.index(slot)
     mbarrier.expect(ready, desc.block_type.nbytes)
     bh = cur.info.batch_head(cur.half)
-    coords = [bh // k.problem.heads, bh % k.problem.heads, cur.j * k.problem.BLOCK_N, 0]
+    kv_head = (bh % k.problem.heads) // k.problem.group
+    coords = [bh // k.problem.heads, kv_head, cur.j * k.problem.BLOCK_N, 0]
     tma.async_copy_global_to_shared(desc, coords, ready, k.smem.kv.index(slot))
     return kv_count + 1
 
@@ -566,7 +569,7 @@ def _issue_pv(k, s_tmem, o_tmem, cur, st):
     else:
         _wait_free(bars.o_free.index(1), o_count1)
         o_count1 += 1
-    p_tile = _p_view(s_tmem.index(s_slot), BN)
+    p_tile = _p_view(s_tmem.index(s_slot), BN, k.q_desc.block_type.element_ty)
     v_tile = _matrix(sm.kv.index(v_slot), BN, D)
     o_h = o_tmem.index(cur.half)
     done = bars.o_ready.index(cur.half)
@@ -730,10 +733,10 @@ def _softmax_step(
         x2 = (float2.pack(chunks[c], axis=1) + neg_m2) * scale2
         prob = gl.exp2(float2.unpack(x2, axis=1))
         sum2 = sum2 + float2.pack(prob, axis=1)
-        probs = probs + (prob.to(gl.float16),)
+        probs = probs + (prob.to(k.q_desc.block_type.element_ty),)
     # one TMEM store for the whole P tile: P aliases S, so the compiler syncs the
     # warpgroup before every store into the slot
-    p_slot = _p_view(s_slot, BN).slice(0, NUM_CHUNKS * CHUNK)
+    p_slot = _p_view(s_slot, BN, k.q_desc.block_type.element_ty).slice(0, NUM_CHUNKS * CHUNK)
     p_slot.store(_join_columns(probs))
     mbarrier.arrive(bars.p_ready.index(slot), count=1)
     sum_a, sum_b = float2.unpack2(sum2.sum(axis=1))
@@ -808,7 +811,7 @@ def _epilogue(k, o_tmem, info, HALF_INDEX: gl.constexpr, state, stores, o_regs: 
     row0 = info.row(HALF_INDEX)
     staging = sm.out.index(stores & 1)
     tma.store_wait(pendings=1)  # the previous store from this staging buffer landed
-    _matrix(staging, HALF, p.HEAD_DIM).store(out.to(gl.float16))
+    _matrix(staging, HALF, p.HEAD_DIM).store(out.to(k.o_desc.block_type.element_ty))
     fence_async_shared()
     coords = p.coords(info, HALF_INDEX)
     tma.async_copy_shared_to_global(k.o_desc, coords, staging)
@@ -845,13 +848,14 @@ def _softmax_half1(k, s_tmem, o_tmem):
 
 @gluon.jit
 def attention_fwd_kernel(
-    q_desc, k_desc, v_desc, o_desc, lse_ptr, qk_scale, heads, batch_heads, seq_q,
+    q_desc, k_desc, v_desc, o_desc, lse_ptr, qk_scale, heads, group, batch_heads, seq_q,
     seq_kv, block, num_full, num_pairs, num_tiles,
     HEAD_DIM: gl.constexpr, BLOCK_N: gl.constexpr, TAIL_N: gl.constexpr,
     KV_BUFFERS: gl.constexpr, CAUSAL: gl.constexpr,
 ):  # fmt: skip
     problem = Problem(
-        gl.to_tensor(qk_scale), gl.to_tensor(heads), gl.to_tensor(batch_heads),
+        gl.to_tensor(qk_scale), gl.to_tensor(heads), gl.to_tensor(group),
+        gl.to_tensor(batch_heads),
         gl.to_tensor(seq_q), gl.to_tensor(seq_kv), gl.to_tensor(block),
         gl.to_tensor(num_full), gl.to_tensor(num_pairs), gl.to_tensor(num_tiles),
         BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL,
@@ -859,10 +863,11 @@ def attention_fwd_kernel(
     vector_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     q_shape: gl.constexpr = [4, 1, 1, HALF, HEAD_DIM]
     kv_shape: gl.constexpr = [KV_BUFFERS, 1, 1, BLOCK_N, HEAD_DIM]
+    dtype: gl.constexpr = q_desc.block_type.element_ty  # fp16 or bf16 operands
     smem = Smem(
-        gl.allocate_shared_memory(gl.float16, q_shape, q_desc.layout),
-        gl.allocate_shared_memory(gl.float16, kv_shape, k_desc.layout),
-        gl.allocate_shared_memory(gl.float16, [2, 1, 1, HALF, HEAD_DIM], o_desc.layout),
+        gl.allocate_shared_memory(dtype, q_shape, q_desc.layout),
+        gl.allocate_shared_memory(dtype, kv_shape, k_desc.layout),
+        gl.allocate_shared_memory(dtype, [2, 1, 1, HALF, HEAD_DIM], o_desc.layout),
         gl.allocate_shared_memory(gl.float32, [4, HALF], vector_layout),
         gl.allocate_shared_memory(gl.float32, [4, HALF], vector_layout),
     )
@@ -915,9 +920,11 @@ def tma_descriptor(x: torch.Tensor, rows: int) -> TensorDescriptor:
     """4D descriptor over a [B, H, S, D] view (any strides) loading [rows, D] boxes;
     rows past S read as zeros and are dropped on store."""
     block = [1, 1, rows, x.shape[-1]]
-    layout = gl.NVMMASharedLayout.get_default_for(block, gl.float16)
+    layout = gl.NVMMASharedLayout.get_default_for(block, GL_DTYPES[x.dtype])
     return TensorDescriptor(x, list(x.shape), list(x.stride()), block, layout)
 
+
+GL_DTYPES = {torch.float16: gl.float16, torch.bfloat16: gl.bfloat16}
 
 _SM_COUNT = {}
 _GRID_LIMIT = 0  # debugging: cap the persistent grid
@@ -960,7 +967,8 @@ def attention_forward(
     attention_fwd_kernel[grid](
         tma_descriptor(q, HALF_ROWS), tma_descriptor(k, BLOCK_N_DEFAULT),
         tma_descriptor(v, BLOCK_N_DEFAULT), tma_descriptor(out, HALF_ROWS),
-        lse, scale * LOG2E, heads, batch * heads, seq_q, seq_kv, max(block, 1), num_full,
+        lse, scale * LOG2E, heads, heads // k.shape[1], batch * heads, seq_q, seq_kv,
+        max(block, 1), num_full,
         num_pairs, num_tiles,
         HEAD_DIM=dim, BLOCK_N=BLOCK_N_DEFAULT, TAIL_N=tail_width(seq_kv),
         KV_BUFFERS=KV_BUFFERS_DEFAULT,

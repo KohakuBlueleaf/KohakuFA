@@ -146,11 +146,11 @@ attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=No
 | | |
 |---|---|
 | dense, token causal, block causal, cross attention (`Sq != Skv`) | yes |
-| fp16 compute; fp32 inputs (cast) | yes |
+| fp16 and bf16 compute; fp32 inputs (cast) | yes |
+| GQA / MQA (`k` / `v` with fewer heads) | yes |
 | head dim 64 | yes |
 | `torch.compile`, CUDA graphs | yes |
-| bf16 compute, head dim 128 | next |
-| GQA / MQA | next |
+| head dim 128 | next |
 | boolean mask, variable length (separate kernel) | planned |
 | analytical block-size autotuner | planned |
 | sm_120 | planned |

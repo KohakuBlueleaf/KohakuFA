@@ -26,10 +26,16 @@ from kohakufa.sm100.fwd import attention_forward
 
 
 def _check(q: Tensor, k: Tensor, v: Tensor) -> None:
-    if q.dtype != torch.float16 or k.dtype != q.dtype or v.dtype != q.dtype:
-        raise TypeError("attention: q, k, v must be fp16")
+    if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise TypeError("attention: q, k, v must be fp16 or bf16 (all the same)")
     if q.shape[-1] != 64:
         raise ValueError("attention: head_dim must be 64")
+    if k.shape != v.shape or k.shape[0] != q.shape[0] or k.shape[-1] != q.shape[-1]:
+        raise ValueError(
+            f"attention: k {tuple(k.shape)} / v {tuple(v.shape)} vs q {tuple(q.shape)}"
+        )
+    if q.shape[1] % k.shape[1]:
+        raise ValueError("attention: query heads must be a multiple of K / V heads (GQA)")
     for t in (q, k, v):
         if t.stride(-1) != 1 or any((s * 2) % 16 for s in t.stride()[:-1]):
             raise ValueError("attention: inputs need a contiguous last dim and 16-byte strides")
