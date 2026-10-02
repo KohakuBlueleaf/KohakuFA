@@ -19,35 +19,58 @@ CHUNKS = (64, 32, 16)  # head-dim chunks: a 16-bit TMA row of 128 B at most (128
 class ForwardConfig:
     """``dc`` x ``nch`` = head dim; ``block_n`` keys per K / V tile; ``s_slots`` S tiles in
     tensor memory (how far QK^T runs ahead of P V); ``q_bufs`` Q buffers per half;
-    ``kv_buffers`` K / V ring depth."""
+    ``kv_slots`` K / V ring slots of ``kv_group`` [block_n, dc] head-dim chunks each
+    (``kv_group`` = nch: one tile per slot); ``halves`` 128-row query halves per CTA (1:
+    one softmax warpgroup, so O of a wide head fits); ``vsplit`` CTAs per query tile,
+    each computing 1 / vsplit of the output's columns (QK^T recomputed by each);
+    ``out_bufs`` output staging buffers."""
 
     dc: int
     nch: int
     block_n: int
     s_slots: int
     q_bufs: int
-    kv_buffers: int
+    kv_slots: int
+    kv_group: int
+    halves: int = 2
+    vsplit: int = 1
+    out_bufs: int = 2
 
     @property
     def head_dim(self) -> int:
         return self.dc * self.nch
 
+    @property
+    def nv(self) -> int:
+        return self.nch // self.vsplit  # head-dim chunks of O per CTA
+
     def tmem_columns(self) -> int:
-        return self.s_slots * self.block_n + 2 * self.head_dim  # S ring + O of two halves
+        return self.s_slots * self.block_n + self.halves * self.nv * self.dc  # S ring + O
 
     def smem_bytes(self, elem_bytes: int = 2) -> int:
-        q = 2 * self.q_bufs * HALF * self.head_dim
-        kv = self.kv_buffers * self.block_n * self.head_dim
-        staging = 2 * HALF * self.dc
+        q = self.halves * self.q_bufs * HALF * self.head_dim
+        kv = self.kv_slots * self.kv_group * self.block_n * self.dc
+        staging = self.out_bufs * HALF * self.dc
         return (q + kv + staging) * elem_bytes + SMEM_RESERVED
 
     def legal(self, elem_bytes: int = 2) -> bool:
+        # two halves share K_j and V_j: a K tile's chunks wait in the ring for the second
+        # half's QK^T while the previous V tile waits for its second P V; one half
+        # releases every chunk after its MMA, so any ring streams
+        ring = self.kv_slots * self.kv_group >= (2 * self.nch if self.halves == 2 else 1)
         return (
             self.tmem_columns() <= TMEM_COLUMNS
             and self.smem_bytes(elem_bytes) <= SMEM_BYTES
             and self.s_slots >= 1
-            and self.kv_buffers >= 2
+            and self.nch % self.vsplit == 0
+            and self.nch % self.kv_group == 0
+            and self.nv % self.kv_group == 0
+            and ring
         )
+
+    def recompute(self) -> float:
+        """MMA work relative to the work proper: QK^T is done by every value part."""
+        return (self.vsplit + 1) / 2
 
 
 def chunk_of(head_dim: int) -> int:
@@ -57,24 +80,69 @@ def chunk_of(head_dim: int) -> int:
     return next(c for c in CHUNKS if head_dim % c == 0)
 
 
-def forward_configs(head_dim: int, elem_bytes: int = 2, block_n: int = 128):
-    """Every legal forward configuration for ``head_dim``."""
-    dc = chunk_of(head_dim)
-    for s_slots in (3, 2, 1):
-        for q_bufs in (2, 1):
-            for kv_buffers in range(8, 1, -1):
-                cfg = ForwardConfig(dc, head_dim // dc, block_n, s_slots, q_bufs, kv_buffers)
-                if cfg.legal(elem_bytes):
-                    yield cfg
+def forward_configs(head_dim: int, elem_bytes: int = 2):
+    """Every legal forward configuration for ``head_dim`` (each ring depth once: the
+    deepest that fits, and a 6-tile cap when deeper fits)."""
+    if head_dim % 16:
+        raise ValueError(f"kernel head dim {head_dim}: a multiple of 16")
+    for dc in (c for c in CHUNKS if head_dim % c == 0):
+        nch = head_dim // dc
+        for block_n in (128, 64):
+            for vsplit in (v for v in (1, 2, 4, 8) if nch % v == 0):
+                for halves in (2, 1):
+                    for s_slots in (3, 2, 1):
+                        for q_bufs in (2, 1):
+                            for out_bufs in (2, 1):
+                                for group in sorted({nch, 2, 1}, reverse=True):
+                                    yield from _ring_depths(
+                                        dc, nch, block_n, s_slots, q_bufs, group, halves,
+                                        vsplit, out_bufs, elem_bytes,
+                                    )  # fmt: skip
+
+
+def _ring_depths(dc, nch, block_n, s_slots, q_bufs, group, halves, vsplit, out_bufs, elem_bytes):
+    cfgs = (
+        ForwardConfig(dc, nch, block_n, s_slots, q_bufs, slots, group, halves, vsplit, out_bufs)
+        for slots in range(32, 0, -1)
+    )
+    legal = [c for c in cfgs if c.legal(elem_bytes)]
+    capped = [c for c in legal if c.kv_slots * c.kv_group <= 6 * nch]
+    yield from {c for c in legal[:1] + capped[:1]}
+
+
+# Measured best per head dim on B300 (16-bit operands, 16k tokens, dense; the heuristic
+# below covers the other head dims)
+FORWARD_TUNED = {
+    128: ForwardConfig(64, 2, 128, 3, 1, 5, 2, halves=1, vsplit=1, out_bufs=1),
+    192: ForwardConfig(64, 3, 128, 2, 1, 2, 3, halves=1, vsplit=1, out_bufs=2),
+    256: ForwardConfig(64, 4, 128, 2, 1, 4, 2, halves=1, vsplit=1, out_bufs=1),
+    320: ForwardConfig(64, 5, 64, 3, 1, 3, 5, halves=1, vsplit=1, out_bufs=1),
+    384: ForwardConfig(64, 6, 64, 2, 1, 6, 2, halves=1, vsplit=1, out_bufs=1),
+    448: ForwardConfig(64, 7, 64, 1, 1, 9, 1, halves=1, vsplit=1, out_bufs=2),
+    512: ForwardConfig(64, 8, 64, 2, 1, 9, 1, halves=1, vsplit=2, out_bufs=1),
+}
 
 
 def forward_config(head_dim: int, elem_bytes: int = 2) -> ForwardConfig:
-    """Default: the deepest S ring that fits (QK^T ahead of P V), then Q double
-    buffering, then the deepest K / V ring (capped at 6, which hides TMA latency)."""
-    for cfg in forward_configs(head_dim, elem_bytes):
-        if cfg.kv_buffers <= 6:
-            return cfg
-    raise ValueError(f"head dim {head_dim}: no forward configuration fits one SM")
+    """Default: an S ring of at least two (QK^T ahead of P V), least recomputation (no
+    value split), two halves, the widest head-dim chunk, a K / V ring of at least three
+    tiles, 128-key tiles, then deeper S ring, Q double buffering, output staging,
+    whole-tile ring slots and the deepest ring up to 6 tiles."""
+    tuned = FORWARD_TUNED.get(head_dim)
+    if tuned is not None and elem_bytes == 2:
+        return tuned
+    configs = list(forward_configs(head_dim, elem_bytes))
+    if not configs:
+        raise ValueError(f"head dim {head_dim}: no forward configuration fits one SM")
+
+    def preference(c):
+        ring = min(c.kv_slots * c.kv_group, 6 * c.nch)
+        return (
+            c.s_slots < 2, c.vsplit, -c.halves, -c.dc, ring < 3 * c.nch, -c.block_n,
+            -c.s_slots, -c.q_bufs, -c.out_bufs, -c.kv_group, -ring,
+        )  # fmt: skip
+
+    return min(configs, key=preference)
 
 
 TILE = 128  # backward: keys per CTA tile = query rows per step

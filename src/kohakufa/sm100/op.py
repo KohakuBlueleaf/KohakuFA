@@ -30,7 +30,12 @@ from kohakufa.sm100.bwd import (
     attention_backward_varlen,
     varlen_backward_tables,
 )
-from kohakufa.sm100.fwd import attention_forward, attention_forward_varlen, varlen_tiles
+from kohakufa.sm100.fwd import (
+    attention_forward,
+    attention_forward_varlen,
+    forward_rows,
+    varlen_tiles,
+)
 
 
 def _check(q: Tensor, k: Tensor, v: Tensor) -> None:
@@ -249,10 +254,11 @@ def varlen_plan(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """The tile tables of a batch of packed sequences (reads ``cu_seqlens`` on the host
     once): build it outside CUDA-graph capture and reuse it for every call with the same
-    lengths."""
-    fwd_tiles = varlen_tiles(cu_seqlens_q, heads, 2 * 128)
+    lengths. The forward's tables come in 256- and 128-row tiles (the latter for wide
+    heads, whose forward runs one 128-row half per CTA)."""
+    fwd_tiles = {rows: varlen_tiles(cu_seqlens_q, heads, rows) for rows in (256, 128)}
     key_tiles, q_tiles, cu_qt = varlen_backward_tables(cu_seqlens_q, cu_seqlens_k, kv_heads, block)
-    return fwd_tiles, key_tiles, q_tiles, cu_qt
+    return fwd_tiles[256], fwd_tiles[128], key_tiles, q_tiles, cu_qt
 
 
 def attention_varlen(
@@ -274,7 +280,9 @@ def attention_varlen(
     cu_seqlens_q, cu_seqlens_k = cu_seqlens_q.int(), cu_seqlens_k.int()
     if plan is None:
         plan = varlen_plan(cu_seqlens_q, cu_seqlens_k, q.shape[1], k.shape[1], block_causal)
+    tiles_256, tiles_128, *tables = plan
+    fwd_tiles = tiles_256 if forward_rows(q.shape[-1], q.element_size()) == 256 else tiles_128
     out, _ = varlen_fwd_op(
-        q, k, v, cu_seqlens_q, cu_seqlens_k, *plan, float(scale), int(block_causal)
+        q, k, v, cu_seqlens_q, cu_seqlens_k, fwd_tiles, *tables, float(scale), int(block_causal)
     )
     return out
