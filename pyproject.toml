@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kohakufa"
+version = "0.1.0"
+description = "Flash attention for NVIDIA Blackwell in Gluon: dense, causal and block-causal attention with a numerically careful softmax that keeps fp16 / bf16 gradients exact where other flash kernels lose them."
+authors = [
+    { name = "Shih-Ying Yeh(KohakuBlueLeaf)", email = "apolloyeh0123@gmail.com" },
+]
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.9",
+    "triton>=3.7",
+]
+keywords = [
+    "attention",
+    "flash-attention",
+    "gpu-kernels",
+    "blackwell",
+    "triton",
+    "gluon",
+    "mixed-precision",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+urls = { Homepage = "https://github.com/KohakuBlueleaf/KohakuFA" }
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "black"]
+bench = ["matplotlib", "numpy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
