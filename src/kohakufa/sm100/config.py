@@ -78,7 +78,6 @@ def forward_config(head_dim: int, elem_bytes: int = 2) -> ForwardConfig:
 
 
 TILE = 128  # backward: keys per CTA tile = query rows per step
-REDUCE_COLS = 32  # backward: fp32 dQ columns per TMA reduce-add (staging [TILE, 32])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,6 +94,19 @@ class BackwardConfig:
     kv_bufs: int
     q_slots: int
     do_slots: int
+    p_regs: int = 0  # registers per thread of the P / dS warpgroups (0: by layout); the
+    ds_regs: int = 0  # reduce warpgroup gets 4 x 128 - p - ds - small (it holds dQ(i): D)
+    small_regs: int = 32  # the one-warp mma and load partitions
+    reduce_cols: int = 0  # fp32 dQ columns per TMA reduce-add (0: min(DC, 32)) ...
+    reduce_stages: int = 1  # ... through a ring of this many [TILE, reduce_cols] buffers
+
+    def __post_init__(self):
+        if not self.reduce_cols:
+            object.__setattr__(self, "reduce_cols", min(self.dc, 32))
+        if not self.p_regs:  # without ALIAS the dS warpgroup holds dP^T (128 fp32)
+            regs = (144, 144) if self.alias else (152, 200)
+            object.__setattr__(self, "p_regs", regs[0])
+            object.__setattr__(self, "ds_regs", regs[1])
 
     @property
     def head_dim(self) -> int:
@@ -102,14 +114,15 @@ class BackwardConfig:
 
     def tmem_columns(self) -> int:
         scores = 2 * TILE  # S^T, dP^T
+        acc = 1 << (self.head_dim - 1).bit_length()  # TMEM blocks are powers of two
         if self.alias:
-            return scores + 2 * self.head_dim  # dV, dK (P^T in S^T, dQ in dP^T)
-        return scores + TILE // 2 + 3 * self.head_dim  # P^T (16-bit), dV, dK, dQ
+            return scores + 2 * acc  # dV, dK (P^T in S^T, dQ in dP^T)
+        return scores + TILE // 2 + 3 * acc  # P^T (16-bit), dV, dK, dQ
 
     def smem_bytes(self, elem_bytes: int = 2) -> int:
         tiles = (2 * self.kv_bufs + self.q_slots + self.do_slots) * TILE * self.head_dim
         ds = TILE * TILE  # dS^T
-        staging = TILE * min(self.dc, REDUCE_COLS) * 4
+        staging = TILE * self.reduce_cols * 4 * self.reduce_stages
         stats = 3 * self.q_slots * TILE * 4
         return (tiles + ds) * elem_bytes + staging + stats + SMEM_RESERVED
 
@@ -121,6 +134,9 @@ class BackwardConfig:
             self.tmem_columns() <= TMEM_COLUMNS
             and self.smem_bytes(elem_bytes) <= SMEM_BYTES
             and 1 <= self.do_slots <= self.q_slots
+            and self.dc % self.reduce_cols == 0
+            # the staging ring doubles as the [TILE, DC] 16-bit dK / dV store buffer
+            and self.reduce_stages * self.reduce_cols * 4 >= self.dc * elem_bytes
         )
 
 
