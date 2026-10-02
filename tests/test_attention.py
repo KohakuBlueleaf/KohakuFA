@@ -206,3 +206,60 @@ def test_gqa(heads, kv_heads, shape, mode, dtype):
     assert got[2].shape == k.shape and got[3].shape == v.shape
     want = reference(q, k, v, dout, 64**-0.5, block=block, groups=heads // kv_heads)
     check(got, want, tol=TOL if dtype == torch.float16 else BF16_TOL)
+
+
+def random_mask(shape, density, seed=3):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.rand(shape, device="cuda", generator=gen) < density
+
+
+@pytest.mark.parametrize(
+    "shape,mask_shape,density",
+    [
+        ((2, 3, 269, 269), "full", 0.5),
+        ((2, 3, 269, 269), "broadcast", 0.3),
+        ((2, 2, 131, 517), "full", 0.7),
+        ((1, 2, 1000, 1000), "head", 0.05),
+    ],
+    ids=str,
+)
+def test_mask(shape, mask_shape, density):
+    batch, heads, s_q, s_kv = shape
+    m_shape = {
+        "full": (batch, heads, s_q, s_kv),
+        "broadcast": (1, 1, s_q, s_kv),
+        "head": (1, heads, s_q, s_kv),
+    }[mask_shape]
+    mask = random_mask(m_shape, density)
+    q, k, v, dout = inputs(*shape)
+    check(run(q, k, v, dout, mask=mask), reference(q, k, v, dout, 64**-0.5, mask=mask))
+
+
+def test_mask_key_padding_and_empty_rows():
+    """[B, 1, 1, Skv] key padding, plus rows that see no key at all (output 0, finite
+    gradients)."""
+    q, k, v, dout = inputs(2, 4, 300, 300)
+    lengths = torch.tensor([300, 157], device="cuda")
+    mask = (torch.arange(300, device="cuda")[None, :] < lengths[:, None])[:, None, None, :]
+    mask = mask.expand(2, 4, 300, 300).clone()
+    mask[:, :, 10:20] = False  # empty rows
+    got = run(q, k, v, dout, mask=mask)
+    assert all(bool(torch.isfinite(g).all()) for g in got)
+    assert bool((got[0][:, :, 10:20] == 0).all())
+    check(got, reference(q, k, v, dout, 64**-0.5, mask=mask))
+
+
+def test_mask_equals_causal():
+    q, k, v, dout = inputs(1, 2, 600, 600)
+    causal = torch.ones(600, 600, dtype=torch.bool, device="cuda").tril()
+    masked = run(q, k, v, dout, mask=causal)
+    native = run(q, k, v, dout, causal=True)
+    for name, a, b in zip(("out", "dq", "dk", "dv"), masked, native):
+        assert metrics(a, b)["rel_err"] < 1e-3, name
+
+
+def test_mask_gqa_bf16():
+    q, k, v, dout = inputs(2, 8, 269, 269, dtype=torch.bfloat16, kv_heads=2)
+    mask = random_mask((2, 8, 269, 269), 0.5)
+    got = run(q, k, v, dout, mask=mask)
+    check(got, reference(q, k, v, dout, 64**-0.5, groups=4, mask=mask), tol=BF16_TOL)

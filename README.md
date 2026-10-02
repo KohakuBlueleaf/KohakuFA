@@ -21,6 +21,7 @@ from kohakufa import attention
 out = attention(q, k, v)                     # dense,  q / k / v [B, H, S, D]
 out = attention(q, k, v, causal=True)        # token causal
 out = attention(q, k, v, block_causal=256)   # frame-causal: frames of 256 tokens
+out = attention(q, k, v, mask=mask)          # any boolean mask, True = visible
 ```
 
 ---
@@ -151,7 +152,8 @@ attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=No
 | head dim 64 | yes |
 | `torch.compile`, CUDA graphs | yes |
 | head dim 128 | next |
-| boolean mask, variable length (separate kernel) | planned |
+| boolean mask (broadcastable `[B, H, Sq, Skv]`, empty rows -> 0) | yes (v1: every tile on the masked path; tile skipping next) |
+| variable length (separate kernel) | planned |
 | analytical block-size autotuner | planned |
 | sm_120 | planned |
 

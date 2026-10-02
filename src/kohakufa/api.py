@@ -16,6 +16,7 @@ def attention(
     causal: bool = False,
     block_causal: int = 0,
     scale: float | None = None,
+    mask: Tensor | None = None,
     compute_dtype: torch.dtype | None = None,
 ) -> Tensor:
     """``softmax(scale q k^T) v``.
@@ -29,6 +30,9 @@ def attention(
         block_causal: frame size ``P > 0``: query ``r`` sees keys of frames up to its
             own, ``c // P <= r // P``. ``causal`` is ``block_causal=1``.
         scale: softmax scale, ``D ** -0.5`` by default.
+        mask: bool, broadcastable to ``[B, H, Sq, Skv]``, True = visible (exclusive with
+            ``causal`` / ``block_causal``: fold those into the mask). A query row that
+            sees no key outputs 0 and gets zero gradients.
         compute_dtype: tensor-core operand dtype; inputs of another dtype (e.g. fp32)
             are cast. Defaults to the inputs' dtype if it is one, else fp16.
 
@@ -44,5 +48,7 @@ def attention(
         raise TypeError(f"compute_dtype {compute_dtype}: one of {COMPUTE_DTYPES}")
     in_dtype = q.dtype
     q, k, v = (t.to(compute_dtype) for t in (q, k, v))
-    out = _sm100_attention(q, k, v, scale, block)
+    if mask is not None and block:
+        raise ValueError("give a mask or causal / block_causal, not both (fold them in)")
+    out = _sm100_attention(q, k, v, scale, block, mask)
     return out if out.dtype == in_dtype else out.to(in_dtype)

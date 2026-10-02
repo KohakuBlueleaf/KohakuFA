@@ -65,7 +65,7 @@ from triton.experimental.gluon.language.nvidia.hopper import fence_async_shared
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 from triton.language.core import _aggregate as aggregate
 
-from kohakufa.sm100.fwd import LOG2E, _join_columns, sm_count, tma_descriptor
+from kohakufa.sm100.fwd import LOG2E, _join_columns, mask_arguments, sm_count, tma_descriptor
 
 TILE_ROWS = 128
 TILE = gl.constexpr(TILE_ROWS)  # keys per CTA tile = query rows per step
@@ -84,13 +84,18 @@ class Problem:
     block: gl.tensor  # block-causal block size (unused when not CAUSAL)
     num_kv_tiles: gl.tensor
     num_tiles: gl.tensor
+    mask_ptr: gl.tensor  # MASK: transposed words, bit c of word w of a key row = query 32 w + c
+    mask_b_stride: gl.tensor
+    mask_h_stride: gl.tensor
+    mask_words: gl.tensor  # words per key row (a multiple of TILE / 32)
     HEAD_DIM: gl.constexpr
     CAUSAL: gl.constexpr
+    MASK: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
         self, qk_scale, heads, group, seq_q, seq_kv, block, num_kv_tiles, num_tiles,
-        HEAD_DIM, CAUSAL,
+        mask_ptr, mask_b_stride, mask_h_stride, mask_words, HEAD_DIM, CAUSAL, MASK,
     ):  # fmt: skip
         self.qk_scale = qk_scale
         self.heads = heads
@@ -100,8 +105,13 @@ class Problem:
         self.block = block
         self.num_kv_tiles = num_kv_tiles
         self.num_tiles = num_tiles
+        self.mask_ptr = mask_ptr
+        self.mask_b_stride = mask_b_stride
+        self.mask_h_stride = mask_h_stride
+        self.mask_words = mask_words
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
         self.CAUSAL = gl.constexpr(CAUSAL)
+        self.MASK = gl.constexpr(MASK)
 
     @gluon.jit
     def key_limit(self, row):
@@ -451,18 +461,28 @@ def _p_partition(k):
         # is 0, so P = exp2(-c m - log2 l) overflows for rows whose scores are all
         # negative, and dQ += dS K would be inf * 0. The key tile holding them runs
         # every step masked; full tiles keep the unmasked path.
-        first_query = gl.where(keys < p.seq_kv, first_query, 2**30)
+        key_ok = keys < p.seq_kv
+        first_query = gl.where(key_ok, first_query, 2**30)
         masked_end = info.first_full
-        if info.kv_start + TILE > p.seq_kv:
+        if info.kv_start + TILE > p.seq_kv or p.MASK:  # MASK: every step masked
             masked_end = info.end_q
         for g in range(p.group):  # the same keys for every query head of the group
-            steps = _p_steps(k, first_query, info.first_q, masked_end, steps, regs, True)
-            steps = _p_steps(k, first_query, masked_end, info.end_q, steps, regs, False)
+            if p.MASK:  # the key rows' words for query head g (padded keys: key_ok)
+                start = info.batch.to(gl.int64) * p.mask_b_stride
+                start += p.q_head(info, g).to(gl.int64) * p.mask_h_stride
+                rows = gl.minimum(keys, p.seq_kv - 1).to(gl.int64)
+                visibility = p.mask_ptr + start + rows * p.mask_words
+            else:
+                visibility = first_query
+            steps = _p_steps(k, visibility, key_ok, info.first_q, masked_end, steps, regs, True)
+            steps = _p_steps(k, visibility, key_ok, masked_end, info.end_q, steps, regs, False)
 
 
 @gluon.jit
-def _p_steps(k, first_query, start, end, steps, regs: gl.constexpr, MASKED: gl.constexpr):
-    """Query tiles ``start .. end - 1``; ``MASKED`` applies the block-causal mask."""
+def _p_steps(k, first_query, key_ok, start, end, steps, regs: gl.constexpr, MASKED: gl.constexpr):
+    """Query tiles ``start .. end - 1``; ``MASKED`` applies the block-causal mask (each
+    key row's first visible query in ``first_query``) or, under MASK, the boolean mask
+    (``first_query`` then points at each key row's words)."""
     p, sm, bars, tm = k.problem, k.smem, k.bars, k.tmem
     NUM_CHUNKS: gl.constexpr = TILE // CHUNK
     col_layout: gl.constexpr = gl.SliceLayout(0, regs)
@@ -482,8 +502,12 @@ def _p_steps(k, first_query, start, end, steps, regs: gl.constexpr, MASKED: gl.c
             x2 = float2.fma(s2 + m2, scale2, log_l2)
             prob = gl.exp2(float2.unpack(x2, axis=1))
             if MASKED:
-                queries = i * TILE + c * CHUNK + offsets
-                visible = queries[None, :] >= first_query[:, None]
+                if p.MASK:  # CHUNK = 32 queries: one word per key row
+                    word = gl.load(first_query + (i * (TILE // CHUNK) + c))
+                    visible = (((word[:, None] >> offsets[None, :]) & 1) != 0) & key_ok[:, None]
+                else:
+                    queries = i * TILE + c * CHUNK + offsets
+                    visible = queries[None, :] >= first_query[:, None]
                 prob = gl.where(visible, prob, 0.0)
             probs = probs + (prob.to(k.q_desc.block_type.element_ty),)
         _wait_free(bars.p_read.index(0), steps)  # the dS warpgroup read P^T(i - 1)
@@ -624,13 +648,15 @@ def _barriers(n: gl.constexpr, count: gl.constexpr = 1):
 @gluon.jit
 def attention_bwd_kernel(
     q_desc, k_desc, v_desc, do_desc, dk_desc, dv_desc, stats_desc, dq_desc, qk_scale, heads, group, seq_q, seq_kv, block, num_kv_tiles, num_tiles,
-    HEAD_DIM: gl.constexpr, CAUSAL: gl.constexpr,
+    mask_ptr, mask_b_stride, mask_h_stride, mask_words,
+    HEAD_DIM: gl.constexpr, CAUSAL: gl.constexpr, MASK: gl.constexpr,
 ):  # fmt: skip
     problem = Problem(
         gl.to_tensor(qk_scale), gl.to_tensor(heads), gl.to_tensor(group),
         gl.to_tensor(seq_q),
         gl.to_tensor(seq_kv), gl.to_tensor(block), gl.to_tensor(num_kv_tiles),
-        gl.to_tensor(num_tiles), HEAD_DIM, CAUSAL,
+        gl.to_tensor(num_tiles), mask_ptr, gl.to_tensor(mask_b_stride),
+        gl.to_tensor(mask_h_stride), gl.to_tensor(mask_words), HEAD_DIM, CAUSAL, MASK,
     )  # fmt: skip
     box: gl.constexpr = [1, 1, TILE, HEAD_DIM]
     # 64-byte swizzle: compute threads store dS^T in 32-column slices
@@ -749,6 +775,7 @@ def attention_backward(
     lse: torch.Tensor,
     scale: float,
     block: int,
+    mask_words_t: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gradients of ``attention_forward``: dq, dk, dv as [B, H, S, D] views of
     [B, S, H, D] storage. Extra memory: (-m, -log2 l, -delta) per row (fp32) and the fp32 dQ
@@ -781,6 +808,8 @@ def attention_backward(
     # (c // P) * P) get zero dK / dV; only key tiles some query sees are launched (a
     # tile with no query step would never signal its dK / dV).
     seen_kv = seq_kv if block == 0 else min(seq_kv, ((seq_q - 1) // block + 1) * block)
+    if mask_words_t is not None:  # every key tile runs (unseen keys get P = 0, dK = dV = 0)
+        seen_kv = seq_kv
     alloc = torch.empty if seen_kv == seq_kv else torch.zeros
     kv_heads = k.shape[1]  # GQA: dK / dV per K / V head, summed over its query heads
     dk = alloc(batch, seq_kv, kv_heads, dim, device=device, dtype=q.dtype)
@@ -795,7 +824,8 @@ def attention_backward(
         tma_descriptor(dk, TILE_ROWS), tma_descriptor(dv, TILE_ROWS),
         stats_desc, dq_desc, scale * LOG2E, heads, heads // kv_heads, seq_q, seq_kv,
         max(block, 1),
-        num_kv_tiles, num_tiles, HEAD_DIM=dim, CAUSAL=block > 0, num_warps=4,
+        num_kv_tiles, num_tiles, *mask_arguments(mask_words_t, device),
+        HEAD_DIM=dim, CAUSAL=block > 0, MASK=mask_words_t is not None, num_warps=4,
     )  # fmt: skip
 
     dq = torch.empty(batch, seq_q, heads, dim, device=device, dtype=q.dtype)

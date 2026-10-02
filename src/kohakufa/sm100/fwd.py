@@ -91,15 +91,21 @@ class Problem:
     num_full: gl.tensor  # 256-row tiles per (batch, head)
     num_pairs: gl.tensor  # paired-tail tiles
     num_tiles: gl.tensor
+    mask_ptr: gl.tensor  # MASK: int32 words, bit c of word w of a row = key 32 w + c visible
+    mask_b_stride: gl.tensor  # words between batches (0: the mask broadcasts)
+    mask_h_stride: gl.tensor  # words between heads (0: the mask broadcasts)
+    mask_words: gl.tensor  # words per query row (a multiple of BLOCK_N / 32)
     BLOCK_N: gl.constexpr  # keys per K / V tile
     TAIL_N: gl.constexpr  # columns computed for the last key tile (< BLOCK_N: narrow)
     HEAD_DIM: gl.constexpr
     CAUSAL: gl.constexpr
+    MASK: gl.constexpr  # a boolean mask (every key tile masked; rows may see no key)
 
     @gluon.constexpr_function
     def __init__(
         self, qk_scale, heads, group, batch_heads, seq_q, seq_kv, block, num_full,
-        num_pairs, num_tiles, BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL,
+        num_pairs, num_tiles, mask_ptr, mask_b_stride, mask_h_stride, mask_words,
+        BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL, MASK,
     ):  # fmt: skip
         self.qk_scale = qk_scale
         self.heads = heads
@@ -111,10 +117,15 @@ class Problem:
         self.num_full = num_full
         self.num_pairs = num_pairs
         self.num_tiles = num_tiles
+        self.mask_ptr = mask_ptr
+        self.mask_b_stride = mask_b_stride
+        self.mask_h_stride = mask_h_stride
+        self.mask_words = mask_words
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.TAIL_N = gl.constexpr(TAIL_N)
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
         self.CAUSAL = gl.constexpr(CAUSAL)
+        self.MASK = gl.constexpr(MASK)
 
     @gluon.jit
     def narrow(self, j):
@@ -168,7 +179,20 @@ class Problem:
     def unmasked_tiles(self, info, half: gl.constexpr):
         """Leading key tiles every row of ``half`` sees in full (no mask needed)."""
         first_row = info.row(half)
-        return gl.minimum(self.key_limit(first_row) // self.BLOCK_N, info.num_kv)
+        if self.MASK:
+            return first_row * 0  # a boolean mask: every key tile is masked
+        else:
+            return gl.minimum(self.key_limit(first_row) // self.BLOCK_N, info.num_kv)
+
+    @gluon.jit
+    def mask_rows(self, info, half: gl.constexpr, rows):
+        """MASK: pointers to the mask words of query ``rows`` of ``half`` (rows past
+        S_q read the last row: their outputs are dropped)."""
+        bh = info.batch_head(half)
+        start = (bh // self.heads).to(gl.int64) * self.mask_b_stride
+        start += (bh % self.heads).to(gl.int64) * self.mask_h_stride
+        rows = gl.minimum(rows, self.seq_q - 1).to(gl.int64)
+        return self.mask_ptr + start + rows * self.mask_words
 
     @gluon.jit
     def coords(self, info, half):
@@ -641,7 +665,10 @@ def _softmax_partition(k, s_tmem, o_tmem, HALF_INDEX: gl.constexpr):
         info = p.tile(tile_id)
         if HALF_INDEX < info.halves:
             rows = info.row(HALF_INDEX) + gl.arange(0, HALF, layout=rows_layout)
-            limit = p.key_limit(rows)
+            if p.MASK:
+                limit = p.mask_rows(info, HALF_INDEX, rows)  # pointers to the row's words
+            else:
+                limit = p.key_limit(rows)
             unmasked = p.unmasked_tiles(info, HALF_INDEX)
             m_i = gl.full([HALF], -float("inf"), gl.float32, rows_layout)
             l_i = gl.full([HALF], 0.0, gl.float32, rows_layout)
@@ -704,8 +731,12 @@ def _softmax_step(
     for c in gl.static_range(NUM_CHUNKS):
         if MASKED:
             s = s_slot.slice(c * CHUNK, CHUNK).load(s_regs)
-            col_limit = limit - (j * BN + c * CHUNK)
-            visible = cols[None, :] < col_limit[:, None]
+            if p.MASK:  # CHUNK = 32 columns: one mask word per row
+                word = gl.load(limit + (j * (BN // CHUNK) + c))
+                visible = ((word[:, None] >> cols[None, :]) & 1) != 0
+            else:
+                col_limit = limit - (j * BN + c * CHUNK)
+                visible = cols[None, :] < col_limit[:, None]
             s = gl.where(visible, s, -float("inf"))
             chunk_max = gl.max(s, axis=1)
         else:
@@ -717,6 +748,8 @@ def _softmax_step(
     if j > 0:
         # double-buffered: this softmax may run a key tile ahead of correction
         alpha = gl.exp2((m_i - m_new) * p.qk_scale)
+        if p.MASK:  # a row with no visible key yet: m stays -inf, nothing to rescale
+            alpha = gl.where(m_new == -float("inf"), 1.0, alpha)
         alpha_index = alpha_base + j - 1
         buffer = 2 * HALF_INDEX + (alpha_index & 1)
         _wait_free(bars.alpha_free.index(buffer), alpha_index // 2)
@@ -725,7 +758,10 @@ def _softmax_step(
         l_i = l_i * alpha
 
     scale2 = float2.full_like(float2.pack(chunks[0], axis=1), p.qk_scale)
-    neg_m = -m_new[:, None].broadcast_to([HALF, CHUNK])
+    if p.MASK:  # no visible key yet: shift by 0 (every score is -inf, P = 0)
+        neg_m = gl.where(m_new == -float("inf"), 0.0, -m_new)[:, None].broadcast_to([HALF, CHUNK])
+    else:
+        neg_m = -m_new[:, None].broadcast_to([HALF, CHUNK])
     neg_m2 = float2.pack(neg_m, axis=1)
     sum2 = float2.full_like(neg_m2, gl.to_tensor(0.0))
     probs = ()
@@ -806,7 +842,10 @@ def _epilogue(k, o_tmem, info, HALF_INDEX: gl.constexpr, state, stores, o_regs: 
     m_i = sm.stats.index(2 * HALF_INDEX).load(rows_layout)
     l_i = sm.stats.index(2 * HALF_INDEX + 1).load(rows_layout)
     mbarrier.arrive(bars.stats_free.index(HALF_INDEX), count=1)
-    out = out * (1.0 / l_i)[:, None]
+    if p.MASK:  # a row that sees no key: output 0
+        out = out * gl.where(l_i == 0.0, 0.0, 1.0 / l_i)[:, None]
+    else:
+        out = out * (1.0 / l_i)[:, None]
 
     row0 = info.row(HALF_INDEX)
     staging = sm.out.index(stores & 1)
@@ -818,8 +857,12 @@ def _epilogue(k, o_tmem, info, HALF_INDEX: gl.constexpr, state, stores, o_regs: 
 
     rows = row0 + gl.arange(0, HALF, layout=rows_layout)
     lse_ptrs = k.lse_ptr + info.batch_head(HALF_INDEX).to(gl.int64) * 2 * p.seq_q + rows
+    log_l = gl.log2(l_i)
+    if p.MASK:  # no visible key: m = +inf makes the backward's P = exp2(c (s - m)) = 0
+        m_i = gl.where(l_i == 0.0, float("inf"), m_i)
+        log_l = gl.where(l_i == 0.0, 0.0, log_l)
     gl.store(lse_ptrs, m_i, mask=rows < p.seq_q)
-    gl.store(lse_ptrs + p.seq_q, gl.log2(l_i), mask=rows < p.seq_q)
+    gl.store(lse_ptrs + p.seq_q, log_l, mask=rows < p.seq_q)
     return tiles + 1, alpha_count, o_count + 1
 
 
@@ -849,16 +892,19 @@ def _softmax_half1(k, s_tmem, o_tmem):
 @gluon.jit
 def attention_fwd_kernel(
     q_desc, k_desc, v_desc, o_desc, lse_ptr, qk_scale, heads, group, batch_heads, seq_q,
-    seq_kv, block, num_full, num_pairs, num_tiles,
+    seq_kv, block, num_full, num_pairs, num_tiles, mask_ptr, mask_b_stride, mask_h_stride,
+    mask_words,
     HEAD_DIM: gl.constexpr, BLOCK_N: gl.constexpr, TAIL_N: gl.constexpr,
-    KV_BUFFERS: gl.constexpr, CAUSAL: gl.constexpr,
+    KV_BUFFERS: gl.constexpr, CAUSAL: gl.constexpr, MASK: gl.constexpr,
 ):  # fmt: skip
     problem = Problem(
         gl.to_tensor(qk_scale), gl.to_tensor(heads), gl.to_tensor(group),
         gl.to_tensor(batch_heads),
         gl.to_tensor(seq_q), gl.to_tensor(seq_kv), gl.to_tensor(block),
         gl.to_tensor(num_full), gl.to_tensor(num_pairs), gl.to_tensor(num_tiles),
-        BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL,
+        mask_ptr, gl.to_tensor(mask_b_stride), gl.to_tensor(mask_h_stride),
+        gl.to_tensor(mask_words),
+        BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL, MASK,
     )  # fmt: skip
     vector_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     q_shape: gl.constexpr = [4, 1, 1, HALF, HEAD_DIM]
@@ -937,12 +983,24 @@ def sm_count(device: torch.device) -> int:
     return _SM_COUNT[index]
 
 
+def mask_arguments(words: torch.Tensor | None, device) -> tuple:
+    """(pointer, batch stride, head stride, words per row) of packed mask words
+    ``[B or 1, H or 1, S, W]`` (a size-1 dimension broadcasts: stride 0); a dummy when
+    there is no mask."""
+    if words is None:
+        return torch.zeros(1, dtype=torch.int32, device=device), 0, 0, 0
+    b_stride = 0 if words.shape[0] == 1 else words.stride(0)
+    h_stride = 0 if words.shape[1] == 1 else words.stride(1)
+    return words, b_stride, h_stride, words.shape[-1]
+
+
 def attention_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
     block: int,
+    mask_words: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``q [B, H, Sq, D]``, ``k / v [B, H, Skv, D]`` fp16 -> ``out [B, H, Sq, D]`` (a
     view of ``[B, Sq, H, D]`` storage) and ``lse [B, H, 2, Sq]`` fp32: per row the max
@@ -969,9 +1027,9 @@ def attention_forward(
         tma_descriptor(v, BLOCK_N_DEFAULT), tma_descriptor(out, HALF_ROWS),
         lse, scale * LOG2E, heads, heads // k.shape[1], batch * heads, seq_q, seq_kv,
         max(block, 1), num_full,
-        num_pairs, num_tiles,
+        num_pairs, num_tiles, *mask_arguments(mask_words, q.device),
         HEAD_DIM=dim, BLOCK_N=BLOCK_N_DEFAULT, TAIL_N=tail_width(seq_kv),
         KV_BUFFERS=KV_BUFFERS_DEFAULT,
-        CAUSAL=block > 0, num_warps=4,
+        CAUSAL=block > 0, MASK=mask_words is not None, num_warps=4,
     )  # fmt: skip
     return out, lse

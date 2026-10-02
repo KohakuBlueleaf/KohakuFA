@@ -21,6 +21,7 @@ padded to 128 rows) and an fp32 dQ accumulator [B, H, Sq, D] while it runs.
 import torch
 from torch import Tensor
 
+from kohakufa.mask import pack
 from kohakufa.sm100.bwd import attention_backward
 from kohakufa.sm100.fwd import attention_forward
 
@@ -43,13 +44,19 @@ def _check(q: Tensor, k: Tensor, v: Tensor) -> None:
 
 @torch.library.custom_op("kohakufa::sm100_forward", mutates_args=())
 def attention_fwd_op(
-    q: Tensor, k: Tensor, v: Tensor, scale: float, block: int
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: float,
+    block: int,
+    mask_words: Tensor | None,
+    mask_words_t: Tensor | None,
 ) -> tuple[Tensor, Tensor]:
-    return attention_forward(q, k, v, scale, block)
+    return attention_forward(q, k, v, scale, block, mask_words)
 
 
 @attention_fwd_op.register_fake
-def _(q, k, v, scale, block):
+def _(q, k, v, scale, block, mask_words, mask_words_t):
     batch, heads, seq_q, dim = q.shape
     out = q.new_empty(batch, seq_q, heads, dim).transpose(1, 2)
     lse = q.new_empty(batch, heads, 2, seq_q, dtype=torch.float32)
@@ -66,12 +73,13 @@ def attention_bwd_op(
     lse: Tensor,
     scale: float,
     block: int,
+    mask_words_t: Tensor | None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    return attention_backward(q, k, v, out, dout, lse, scale, block)
+    return attention_backward(q, k, v, out, dout, lse, scale, block, mask_words_t)
 
 
 @attention_bwd_op.register_fake
-def _(q, k, v, out, dout, lse, scale, block):
+def _(q, k, v, out, dout, lse, scale, block, mask_words_t):
     def like(t):
         batch, heads, seq, dim = t.shape
         return t.new_empty(batch, seq, heads, dim).transpose(1, 2)
@@ -80,32 +88,44 @@ def _(q, k, v, out, dout, lse, scale, block):
 
 
 def _setup_context(ctx, inputs, output):
-    q, k, v, scale, block = inputs
+    q, k, v, scale, block, _, mask_words_t = inputs
     out, lse = output
-    ctx.save_for_backward(q, k, v, out, lse)
+    ctx.save_for_backward(q, k, v, out, lse, mask_words_t)
     ctx.scale = scale
     ctx.block = block
     ctx.mark_non_differentiable(lse)
 
 
 def _backward(ctx, dout, dlse):
-    q, k, v, out, lse = ctx.saved_tensors
+    q, k, v, out, lse, mask_words_t = ctx.saved_tensors
     if dout.stride(-1) != 1 or any((s * 2) % 16 for s in dout.stride()[:-1]):
         dout = dout.contiguous()
-    dq, dk, dv = attention_bwd_op(q, k, v, out, dout, lse, ctx.scale, ctx.block)
-    return dq, dk, dv, None, None
+    dq, dk, dv = attention_bwd_op(q, k, v, out, dout, lse, ctx.scale, ctx.block, mask_words_t)
+    return dq, dk, dv, None, None, None, None
 
 
 attention_fwd_op.register_autograd(_backward, setup_context=_setup_context)
 
 
 def attention(
-    q: Tensor, k: Tensor, v: Tensor, scale: float | None = None, block_causal: int = 0
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: float | None = None,
+    block_causal: int = 0,
+    mask: Tensor | None = None,
 ) -> Tensor:
     """``softmax(scale q k^T) v`` over ``[B, H, S, D]``; ``block_causal > 0``: tokens of
-    block ``i`` (``block_causal`` consecutive tokens) see blocks ``0..i`` only."""
+    block ``i`` (``block_causal`` consecutive tokens) see blocks ``0..i`` only; ``mask``:
+    a bool mask broadcastable to ``[B, H, Sq, Skv]`` (True = visible; a row with no
+    visible key outputs 0)."""
     _check(q, k, v)
     if scale is None:
         scale = q.shape[-1] ** -0.5
-    out, _ = attention_fwd_op(q, k, v, float(scale), int(block_causal))
+    words = words_t = None
+    if mask is not None:
+        if block_causal:
+            raise ValueError("attention: give a mask or block_causal, not both (fold it in)")
+        words, words_t = pack(mask, q.shape[0], q.shape[1], q.shape[2], k.shape[2])
+    out, _ = attention_fwd_op(q, k, v, float(scale), int(block_causal), words, words_t)
     return out
