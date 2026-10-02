@@ -16,12 +16,15 @@ The short version of what this repository found: **"fp16 training is unstable" w
 fault, it was the attention kernel's.** The details are in [docs/precision.md](docs/precision.md).
 
 ```python
-from kohakufa import attention
+from kohakufa import attention, attention_varlen
 
 out = attention(q, k, v)                     # dense,  q / k / v [B, H, S, D]
 out = attention(q, k, v, causal=True)        # token causal
 out = attention(q, k, v, block_causal=256)   # frame-causal: frames of 256 tokens
 out = attention(q, k, v, mask=mask)          # any boolean mask, True = visible
+
+# packed variable-length sequences: q [Tq, H, D], k / v [Tk, Hkv, D]
+out = attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal=True)
 ```
 
 ---
@@ -153,7 +156,7 @@ attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=No
 | `torch.compile`, CUDA graphs | yes |
 | head dim 128 | next |
 | boolean mask (broadcastable `[B, H, Sq, Skv]`, empty rows -> 0) | yes (v1: every tile on the masked path; tile skipping next) |
-| variable length (separate kernel) | planned |
+| variable length (packed sequences, `cu_seqlens`; no padding computed) | yes |
 | analytical block-size autotuner | planned |
 | sm_120 | planned |
 

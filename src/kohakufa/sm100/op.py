@@ -22,8 +22,12 @@ import torch
 from torch import Tensor
 
 from kohakufa.mask import pack
-from kohakufa.sm100.bwd import attention_backward
-from kohakufa.sm100.fwd import attention_forward
+from kohakufa.sm100.bwd import (
+    attention_backward,
+    attention_backward_varlen,
+    varlen_backward_tables,
+)
+from kohakufa.sm100.fwd import attention_forward, attention_forward_varlen, varlen_tiles
 
 
 def _check(q: Tensor, k: Tensor, v: Tensor) -> None:
@@ -128,4 +132,114 @@ def attention(
             raise ValueError("attention: give a mask or block_causal, not both (fold it in)")
         words, words_t = pack(mask, q.shape[0], q.shape[1], q.shape[2], k.shape[2])
     out, _ = attention_fwd_op(q, k, v, float(scale), int(block_causal), words, words_t)
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# Variable-length (packed) sequences
+# --------------------------------------------------------------------------------------
+
+
+@torch.library.custom_op("kohakufa::sm100_varlen_forward", mutates_args=())
+def varlen_fwd_op(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    fwd_tiles: Tensor,
+    key_tiles: Tensor,
+    q_tiles: Tensor,
+    cu_qt: Tensor,
+    scale: float,
+    block: int,
+) -> tuple[Tensor, Tensor]:
+    return attention_forward_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, fwd_tiles, scale, block)
+
+
+@varlen_fwd_op.register_fake
+def _(q, k, v, cu_seqlens_q, cu_seqlens_k, fwd_tiles, key_tiles, q_tiles, cu_qt, scale, block):
+    return torch.empty_like(q), q.new_empty(1, q.shape[1], 2, q.shape[0], dtype=torch.float32)
+
+
+@torch.library.custom_op("kohakufa::sm100_varlen_backward", mutates_args=())
+def varlen_bwd_op(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    dout: Tensor,
+    lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    key_tiles: Tensor,
+    q_tiles: Tensor,
+    cu_qt: Tensor,
+    scale: float,
+    block: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    return attention_backward_varlen(
+        q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, key_tiles, q_tiles, cu_qt,
+        scale, block,
+    )  # fmt: skip
+
+
+@varlen_bwd_op.register_fake
+def _(q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, key_tiles, q_tiles, cu_qt, scale, block):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def _varlen_setup(ctx, inputs, output):
+    q, k, v, cu_q, cu_k, _, key_tiles, q_tiles, cu_qt, scale, block = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse, cu_q, cu_k, key_tiles, q_tiles, cu_qt)
+    ctx.scale, ctx.block = scale, block
+    ctx.mark_non_differentiable(lse)
+
+
+def _varlen_backward(ctx, dout, dlse):
+    q, k, v, out, lse, cu_q, cu_k, key_tiles, q_tiles, cu_qt = ctx.saved_tensors
+    dq, dk, dv = varlen_bwd_op(
+        q, k, v, out, dout.contiguous(), lse, cu_q, cu_k, key_tiles, q_tiles, cu_qt,
+        ctx.scale, ctx.block,
+    )  # fmt: skip
+    return dq, dk, dv, None, None, None, None, None, None, None, None
+
+
+varlen_fwd_op.register_autograd(_varlen_backward, setup_context=_varlen_setup)
+
+
+def varlen_plan(
+    cu_seqlens_q: Tensor, cu_seqlens_k: Tensor, heads: int, kv_heads: int, block: int = 0
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """The tile tables of a batch of packed sequences (reads ``cu_seqlens`` on the host
+    once): build it outside CUDA-graph capture and reuse it for every call with the same
+    lengths."""
+    fwd_tiles = varlen_tiles(cu_seqlens_q, heads, 2 * 128)
+    key_tiles, q_tiles, cu_qt = varlen_backward_tables(cu_seqlens_q, cu_seqlens_k, kv_heads, block)
+    return fwd_tiles, key_tiles, q_tiles, cu_qt
+
+
+def attention_varlen(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    scale: float | None = None,
+    block_causal: int = 0,
+    plan: tuple | None = None,
+) -> Tensor:
+    """Packed sequences, each its own attention problem: ``q [Tq, H, D]``, ``k / v
+    [Tk, Hkv, D]``; sequence ``b`` is rows ``cu_seqlens[b] : cu_seqlens[b + 1]``
+    (int32 [B + 1] on the device). ``plan`` from ``varlen_plan`` (built here if None)."""
+    _check(*(t.unsqueeze(0).transpose(1, 2) for t in (q, k, v)))
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+    cu_seqlens_q, cu_seqlens_k = cu_seqlens_q.int(), cu_seqlens_k.int()
+    if plan is None:
+        plan = varlen_plan(cu_seqlens_q, cu_seqlens_k, q.shape[1], k.shape[1], block_causal)
+    out, _ = varlen_fwd_op(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, *plan, float(scale), int(block_causal)
+    )
     return out

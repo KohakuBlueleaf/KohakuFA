@@ -41,7 +41,10 @@ def run(q, k, v, dout, **kwargs):
 def check(got, want, tol=TOL):
     for name, g, w in zip(("out", "dq", "dk", "dv"), got, want):
         m = metrics(g, w)
-        assert m["rel_err"] < tol, f"{name}: {m}"
+        if float(w.abs().max()) == 0.0:  # an exactly-zero gradient (e.g. one visible key)
+            assert m["max_abs_err"] < 1e-4, f"{name}: {m}"
+        else:
+            assert m["rel_err"] < tol, f"{name}: {m}"
 
 
 CAUSAL = [  # (batch, heads, s_q, s_kv)
@@ -263,3 +266,75 @@ def test_mask_gqa_bf16():
     mask = random_mask((2, 8, 269, 269), 0.5)
     got = run(q, k, v, dout, mask=mask)
     check(got, reference(q, k, v, dout, 64**-0.5, groups=4, mask=mask), tol=BF16_TOL)
+
+
+def packed(lengths, heads, kv_heads, dtype=torch.float16, seed=4):
+    """Packed q [T, H, D], k / v [T, Hkv, D], dout, and cu_seqlens."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    total = sum(lengths)
+    cu = torch.tensor([0] + list(torch.tensor(lengths).cumsum(0)), dtype=torch.int32, device="cuda")
+
+    def make(h):
+        return torch.randn(total, h, 64, device="cuda", generator=gen).to(dtype).requires_grad_()
+
+    dout = torch.randn(total, heads, 64, device="cuda", generator=gen).to(dtype)
+    return make(heads), make(kv_heads), make(kv_heads), dout, cu
+
+
+def check_varlen(lengths, heads, kv_heads, block, dtype=torch.float16, tol=TOL):
+    from kohakufa import attention_varlen
+
+    q, k, v, dout, cu = packed(lengths, heads, kv_heads, dtype)
+    out = attention_varlen(q, k, v, cu, cu, block_causal=block)
+    out.backward(dout)
+    for b in range(len(lengths)):
+        s, e = int(cu[b]), int(cu[b + 1])
+
+        def view(t, s=s, e=e):
+            return t[s:e].unsqueeze(0).transpose(1, 2)
+
+        want = reference(view(q), view(k), view(v), view(dout), 64**-0.5, block=block,
+                         groups=heads // kv_heads)  # fmt: skip
+        got = (view(out), view(q.grad), view(k.grad), view(v.grad))
+        check(got, want, tol=tol)
+
+
+@pytest.mark.parametrize(
+    "lengths,heads,kv_heads,block",
+    [
+        ([5, 300, 129, 1000, 256], 4, 4, 0),
+        ([1, 77, 512, 3, 1300], 8, 2, 1),
+        ([600, 257, 24], 3, 3, 24),
+        ([128, 256, 384], 2, 1, 0),
+    ],
+    ids=str,
+)
+def test_varlen(lengths, heads, kv_heads, block):
+    check_varlen(lengths, heads, kv_heads, block)
+
+
+def test_varlen_bf16():
+    check_varlen([300, 129, 700], 4, 2, 1, dtype=torch.bfloat16, tol=BF16_TOL)
+
+
+def test_varlen_cuda_graph():
+    from kohakufa import attention_varlen, varlen_plan
+
+    q, k, v, dout, cu = packed([300, 129, 700], 4, 4)
+    plan = varlen_plan(cu, cu, 4, 4, 1)  # built outside capture: no host sync inside
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            attention_varlen(q, k, v, cu, cu, causal=True, plan=plan).backward(dout)
+        for t in (q, k, v):
+            t.grad = None
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = attention_varlen(q, k, v, cu, cu, causal=True, plan=plan)
+            out.backward(dout)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = attention_varlen(*(t.detach() for t in (q, k, v)), cu, cu, causal=True)
+    assert metrics(out, eager)["rel_err"] < 1e-6

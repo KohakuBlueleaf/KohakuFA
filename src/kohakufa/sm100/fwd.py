@@ -95,17 +95,24 @@ class Problem:
     mask_b_stride: gl.tensor  # words between batches (0: the mask broadcasts)
     mask_h_stride: gl.tensor  # words between heads (0: the mask broadcasts)
     mask_words: gl.tensor  # words per query row (a multiple of BLOCK_N / 32)
+    tiles_ptr: gl.tensor  # VARLEN: int32 [num_tiles, 3] = (sequence, head, first row)
+    cu_q_ptr: gl.tensor  # VARLEN: int32 [B + 1] packed query offsets
+    cu_k_ptr: gl.tensor  # VARLEN: int32 [B + 1] packed key offsets
+    o_ptr: gl.tensor  # VARLEN: the output, for row-masked stores at sequence ends
+    o_row_stride: gl.tensor  # VARLEN: elements between packed output rows (H * D)
     BLOCK_N: gl.constexpr  # keys per K / V tile
     TAIL_N: gl.constexpr  # columns computed for the last key tile (< BLOCK_N: narrow)
     HEAD_DIM: gl.constexpr
     CAUSAL: gl.constexpr
     MASK: gl.constexpr  # a boolean mask (every key tile masked; rows may see no key)
+    VARLEN: gl.constexpr  # packed sequences of their own lengths (``tiles_ptr``)
 
     @gluon.constexpr_function
     def __init__(
         self, qk_scale, heads, group, batch_heads, seq_q, seq_kv, block, num_full,
         num_pairs, num_tiles, mask_ptr, mask_b_stride, mask_h_stride, mask_words,
-        BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL, MASK,
+        tiles_ptr, cu_q_ptr, cu_k_ptr, o_ptr, o_row_stride,
+        BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL, MASK, VARLEN,
     ):  # fmt: skip
         self.qk_scale = qk_scale
         self.heads = heads
@@ -121,11 +128,17 @@ class Problem:
         self.mask_b_stride = mask_b_stride
         self.mask_h_stride = mask_h_stride
         self.mask_words = mask_words
+        self.tiles_ptr = tiles_ptr
+        self.cu_q_ptr = cu_q_ptr
+        self.cu_k_ptr = cu_k_ptr
+        self.o_ptr = o_ptr
+        self.o_row_stride = o_row_stride
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.TAIL_N = gl.constexpr(TAIL_N)
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
         self.CAUSAL = gl.constexpr(CAUSAL)
         self.MASK = gl.constexpr(MASK)
+        self.VARLEN = gl.constexpr(VARLEN)
 
     @gluon.jit
     def narrow(self, j):
@@ -137,15 +150,40 @@ class Problem:
             return gl.constexpr(False)
 
     @gluon.jit
-    def key_limit(self, row):
-        """Keys visible to query ``row`` (scalar or tensor): [0, key_limit)."""
+    def key_limit(self, row, seq_kv):
+        """Keys visible to query ``row`` (scalar or tensor) of a sequence with
+        ``seq_kv`` keys: [0, key_limit)."""
         if self.CAUSAL:
-            return gl.minimum((row // self.block + 1) * self.block, self.seq_kv)
+            return gl.minimum((row // self.block + 1) * self.block, seq_kv)
         else:
-            return row * 0 + self.seq_kv
+            return row * 0 + seq_kv
 
     @gluon.jit
     def tile(self, tile_id):
+        if self.VARLEN:
+            return self._varlen_tile(tile_id)
+        else:
+            return self._dense_tile(tile_id)
+
+    @gluon.jit
+    def _varlen_tile(self, tile_id):
+        """VARLEN: entry ``tile_id`` of the tile table, (sequence, head, first row);
+        both halves read the head's K / V of that sequence."""
+        # the producer cursors look ahead past the last tile: clamp (values unused)
+        entry = self.tiles_ptr + gl.minimum(tile_id, self.num_tiles - 1) * 3
+        seq, head, row0 = gl.load(entry), gl.load(entry + 1), gl.load(entry + 2)
+        q_off = gl.load(self.cu_q_ptr + seq)
+        seq_q = gl.load(self.cu_q_ptr + seq + 1) - q_off
+        k_off = gl.load(self.cu_k_ptr + seq)
+        seq_kv = gl.load(self.cu_k_ptr + seq + 1) - k_off
+        last_row = gl.minimum(row0 + 2 * HALF, seq_q)
+        num_kv = gl.cdiv(self.key_limit(last_row - 1, seq_kv), self.BLOCK_N)
+        halves = gl.where(row0 + HALF < seq_q, 2, 1)
+        return TileInfo(head, row0, head, row0 + HALF, num_kv, halves, head * 0 + 1,
+                        seq_q, seq_kv, q_off, k_off)  # fmt: skip
+
+    @gluon.jit
+    def _dense_tile(self, tile_id):
         """Coordinates and key-loop bounds of CTA tile ``tile_id``."""
         # paired tails: heads 2 p and 2 p + 1, rows from tail_start (last rows: for
         # block-causal they see the most keys, so they come first)
@@ -170,10 +208,11 @@ class Problem:
         row0 = gl.where(pair, tail_start, q_start)
         row1 = gl.where(pair, tail_start, q_start + HALF)
         last_row = gl.where(pair, self.seq_q, gl.minimum(q_start + 2 * HALF, self.seq_q))
-        num_kv = gl.cdiv(self.key_limit(last_row - 1), self.BLOCK_N)
+        num_kv = gl.cdiv(self.key_limit(last_row - 1, self.seq_kv), self.BLOCK_N)
         halves = gl.where(pair, gl.where(bh_tail + 1 < self.batch_heads, 2, 1),
                           gl.where(q_start + HALF < self.seq_q, 2, 1))  # fmt: skip
-        return TileInfo(bh0, row0, bh1, row1, num_kv, halves, gl.where(pair, 0, 1))
+        return TileInfo(bh0, row0, bh1, row1, num_kv, halves, gl.where(pair, 0, 1),
+                        self.seq_q, self.seq_kv, tile_id * 0, tile_id * 0)  # fmt: skip
 
     @gluon.jit
     def unmasked_tiles(self, info, half: gl.constexpr):
@@ -182,7 +221,7 @@ class Problem:
         if self.MASK:
             return first_row * 0  # a boolean mask: every key tile is masked
         else:
-            return gl.minimum(self.key_limit(first_row) // self.BLOCK_N, info.num_kv)
+            return gl.minimum(self.key_limit(first_row, info.seq_kv) // self.BLOCK_N, info.num_kv)
 
     @gluon.jit
     def mask_rows(self, info, half: gl.constexpr, rows):
@@ -191,14 +230,14 @@ class Problem:
         bh = info.batch_head(half)
         start = (bh // self.heads).to(gl.int64) * self.mask_b_stride
         start += (bh % self.heads).to(gl.int64) * self.mask_h_stride
-        rows = gl.minimum(rows, self.seq_q - 1).to(gl.int64)
+        rows = gl.minimum(rows, info.seq_q - 1).to(gl.int64)
         return self.mask_ptr + start + rows * self.mask_words
 
     @gluon.jit
     def coords(self, info, half):
         """TMA coordinates [batch, head, first row, 0] of ``half``'s query rows."""
         bh = info.batch_head(half)
-        return [bh // self.heads, bh % self.heads, info.row(half), 0]
+        return [bh // self.heads, bh % self.heads, info.q_off + info.row(half), 0]
 
 
 @aggregate
@@ -213,9 +252,13 @@ class TileInfo:
     num_kv: gl.tensor  # key tiles the tile visits (later ones are fully hidden)
     halves: gl.tensor  # 2, or 1 when there is no second half
     shared: gl.tensor
+    seq_q: gl.tensor  # the tile's sequence: queries, keys, and packed row offsets
+    seq_kv: gl.tensor  # (dense: the problem's lengths and offsets 0)
+    q_off: gl.tensor
+    k_off: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, bh0, row0, bh1, row1, num_kv, halves, shared):
+    def __init__(self, bh0, row0, bh1, row1, num_kv, halves, shared, seq_q, seq_kv, q_off, k_off):
         self.bh0 = bh0
         self.row0 = row0
         self.bh1 = bh1
@@ -223,6 +266,10 @@ class TileInfo:
         self.num_kv = num_kv
         self.halves = halves
         self.shared = shared
+        self.seq_q = seq_q
+        self.seq_kv = seq_kv
+        self.q_off = q_off
+        self.k_off = k_off
 
     @gluon.jit
     def batch_head(self, half):
@@ -505,7 +552,7 @@ def _load_kv(k, desc, cur, kv_count):
     mbarrier.expect(ready, desc.block_type.nbytes)
     bh = cur.info.batch_head(cur.half)
     kv_head = (bh % k.problem.heads) // k.problem.group
-    coords = [bh // k.problem.heads, kv_head, cur.j * k.problem.BLOCK_N, 0]
+    coords = [bh // k.problem.heads, kv_head, cur.info.k_off + cur.j * k.problem.BLOCK_N, 0]
     tma.async_copy_global_to_shared(desc, coords, ready, k.smem.kv.index(slot))
     return kv_count + 1
 
@@ -668,7 +715,7 @@ def _softmax_partition(k, s_tmem, o_tmem, HALF_INDEX: gl.constexpr):
             if p.MASK:
                 limit = p.mask_rows(info, HALF_INDEX, rows)  # pointers to the row's words
             else:
-                limit = p.key_limit(rows)
+                limit = p.key_limit(rows, info.seq_kv)
             unmasked = p.unmasked_tiles(info, HALF_INDEX)
             m_i = gl.full([HALF], -float("inf"), gl.float32, rows_layout)
             l_i = gl.full([HALF], 0.0, gl.float32, rows_layout)
@@ -848,21 +895,32 @@ def _epilogue(k, o_tmem, info, HALF_INDEX: gl.constexpr, state, stores, o_regs: 
         out = out * (1.0 / l_i)[:, None]
 
     row0 = info.row(HALF_INDEX)
-    staging = sm.out.index(stores & 1)
-    tma.store_wait(pendings=1)  # the previous store from this staging buffer landed
-    _matrix(staging, HALF, p.HEAD_DIM).store(out.to(k.o_desc.block_type.element_ty))
-    fence_async_shared()
-    coords = p.coords(info, HALF_INDEX)
-    tma.async_copy_shared_to_global(k.o_desc, coords, staging)
-
     rows = row0 + gl.arange(0, HALF, layout=rows_layout)
-    lse_ptrs = k.lse_ptr + info.batch_head(HALF_INDEX).to(gl.int64) * 2 * p.seq_q + rows
+    if p.VARLEN and row0 + HALF > info.seq_q:
+        # the sequence ends inside this half: a full TMA box would overwrite the next
+        # sequence's rows, so store row-masked from registers
+        head = info.batch_head(HALF_INDEX) % p.heads
+        cols = gl.arange(0, p.HEAD_DIM, layout=gl.SliceLayout(0, o_regs))
+        packed = (info.q_off + rows).to(gl.int64) * p.o_row_stride + head * p.HEAD_DIM
+        ptrs = p.o_ptr + packed[:, None] + cols[None, :]
+        gl.store(ptrs, out.to(p.o_ptr.dtype.element_ty), mask=(rows < info.seq_q)[:, None])
+    else:
+        staging = sm.out.index(stores & 1)
+        tma.store_wait(pendings=1)  # the previous store from this staging buffer landed
+        _matrix(staging, HALF, p.HEAD_DIM).store(out.to(k.o_desc.block_type.element_ty))
+        fence_async_shared()
+        coords = p.coords(info, HALF_INDEX)
+        tma.async_copy_shared_to_global(k.o_desc, coords, staging)
+
+    # lse [B, H, 2, S] (VARLEN: [1, H, 2, total rows], the sequence at q_off)
+    lse_ptrs = k.lse_ptr + info.batch_head(HALF_INDEX).to(gl.int64) * 2 * p.seq_q
+    lse_ptrs += info.q_off + rows
     log_l = gl.log2(l_i)
     if p.MASK:  # no visible key: m = +inf makes the backward's P = exp2(c (s - m)) = 0
         m_i = gl.where(l_i == 0.0, float("inf"), m_i)
         log_l = gl.where(l_i == 0.0, 0.0, log_l)
-    gl.store(lse_ptrs, m_i, mask=rows < p.seq_q)
-    gl.store(lse_ptrs + p.seq_q, log_l, mask=rows < p.seq_q)
+    gl.store(lse_ptrs, m_i, mask=rows < info.seq_q)
+    gl.store(lse_ptrs + p.seq_q, log_l, mask=rows < info.seq_q)
     return tiles + 1, alpha_count, o_count + 1
 
 
@@ -893,9 +951,10 @@ def _softmax_half1(k, s_tmem, o_tmem):
 def attention_fwd_kernel(
     q_desc, k_desc, v_desc, o_desc, lse_ptr, qk_scale, heads, group, batch_heads, seq_q,
     seq_kv, block, num_full, num_pairs, num_tiles, mask_ptr, mask_b_stride, mask_h_stride,
-    mask_words,
+    mask_words, tiles_ptr, cu_q_ptr, cu_k_ptr, o_ptr, o_row_stride,
     HEAD_DIM: gl.constexpr, BLOCK_N: gl.constexpr, TAIL_N: gl.constexpr,
     KV_BUFFERS: gl.constexpr, CAUSAL: gl.constexpr, MASK: gl.constexpr,
+    VARLEN: gl.constexpr,
 ):  # fmt: skip
     problem = Problem(
         gl.to_tensor(qk_scale), gl.to_tensor(heads), gl.to_tensor(group),
@@ -903,8 +962,9 @@ def attention_fwd_kernel(
         gl.to_tensor(seq_q), gl.to_tensor(seq_kv), gl.to_tensor(block),
         gl.to_tensor(num_full), gl.to_tensor(num_pairs), gl.to_tensor(num_tiles),
         mask_ptr, gl.to_tensor(mask_b_stride), gl.to_tensor(mask_h_stride),
-        gl.to_tensor(mask_words),
-        BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL, MASK,
+        gl.to_tensor(mask_words), tiles_ptr, cu_q_ptr, cu_k_ptr, o_ptr,
+        gl.to_tensor(o_row_stride),
+        BLOCK_N, TAIL_N, HEAD_DIM, CAUSAL, MASK, VARLEN,
     )  # fmt: skip
     vector_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     q_shape: gl.constexpr = [4, 1, 1, HALF, HEAD_DIM]
@@ -1028,8 +1088,60 @@ def attention_forward(
         lse, scale * LOG2E, heads, heads // k.shape[1], batch * heads, seq_q, seq_kv,
         max(block, 1), num_full,
         num_pairs, num_tiles, *mask_arguments(mask_words, q.device),
+        *_no_varlen(q.device),
         HEAD_DIM=dim, BLOCK_N=BLOCK_N_DEFAULT, TAIL_N=tail_width(seq_kv),
         KV_BUFFERS=KV_BUFFERS_DEFAULT,
-        CAUSAL=block > 0, MASK=mask_words is not None, num_warps=4,
+        CAUSAL=block > 0, MASK=mask_words is not None, VARLEN=False, num_warps=4,
+    )  # fmt: skip
+    return out, lse
+
+
+def _no_varlen(device) -> tuple:
+    """Dummy VARLEN arguments for the dense kernels."""
+    dummy = torch.zeros(1, dtype=torch.int32, device=device)
+    return dummy, dummy, dummy, dummy, 0
+
+
+def varlen_tiles(cu_seqlens_q: torch.Tensor, heads: int, rows: int) -> torch.Tensor:
+    """The VARLEN tile table: int32 [tiles, 3] = (sequence, head, first row) for every
+    ``rows``-row query tile of every sequence and head, longest sequences first (their
+    tiles take longest: they start before the short ones' tails)."""
+    lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+    entries = []
+    for seq in sorted(range(len(lengths)), key=lambda s: -lengths[s]):
+        for start in range(0, lengths[seq], rows):
+            entries += [(seq, head, start) for head in range(heads)]
+    return torch.tensor(entries or [(0, 0, 0)], dtype=torch.int32, device=cu_seqlens_q.device)
+
+
+def attention_forward_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    tiles: torch.Tensor,
+    scale: float,
+    block: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packed sequences: ``q [Tq, H, D]``, ``k / v [Tk, Hkv, D]``, sequence ``b`` at rows
+    ``cu_seqlens[b] : cu_seqlens[b + 1]`` (int32), ``tiles`` from ``varlen_tiles``.
+    Returns ``out [Tq, H, D]`` and ``lse [1, H, 2, Tq]``. Every sequence is its own
+    attention problem (``block`` > 0: block-causal within it); no padding is computed."""
+    total_q, heads, dim = q.shape
+    out = torch.empty_like(q)
+    lse = torch.empty(1, heads, 2, total_q, device=q.device, dtype=torch.float32)
+    q4, k4, v4, o4 = (t.unsqueeze(0).transpose(1, 2) for t in (q, k, v, out))
+    num_tiles = tiles.shape[0]
+    grid = (min(num_tiles, _GRID_LIMIT or sm_count(q.device)),)
+    attention_fwd_kernel[grid](
+        tma_descriptor(q4, HALF_ROWS), tma_descriptor(k4, BLOCK_N_DEFAULT),
+        tma_descriptor(v4, BLOCK_N_DEFAULT), tma_descriptor(o4, HALF_ROWS),
+        lse, scale * LOG2E, heads, heads // k.shape[1], heads, total_q, k.shape[0],
+        max(block, 1), 0, 0, num_tiles, *mask_arguments(None, q.device),
+        tiles, cu_seqlens_q, cu_seqlens_k, out, heads * dim,
+        HEAD_DIM=dim, BLOCK_N=BLOCK_N_DEFAULT, TAIL_N=BLOCK_N_DEFAULT,
+        KV_BUFFERS=KV_BUFFERS_DEFAULT,
+        CAUSAL=block > 0, MASK=False, VARLEN=True, num_warps=4,
     )  # fmt: skip
     return out, lse

@@ -6,7 +6,7 @@
 See README.md for what is supported and docs/precision.md for the numerics.
 """
 
-from kohakufa.api import attention
+from kohakufa.api import attention, attention_varlen, varlen_plan
 
-__all__ = ["attention"]
+__all__ = ["attention", "attention_varlen", "varlen_plan"]
 __version__ = "0.1.0"

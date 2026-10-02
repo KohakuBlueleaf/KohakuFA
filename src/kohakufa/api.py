@@ -4,6 +4,8 @@ import torch
 from torch import Tensor
 
 from kohakufa.sm100.op import attention as _sm100_attention
+from kohakufa.sm100.op import attention_varlen as _sm100_attention_varlen
+from kohakufa.sm100.op import varlen_plan  # noqa: F401 (re-exported)
 
 COMPUTE_DTYPES = (torch.float16, torch.bfloat16)
 
@@ -52,3 +54,29 @@ def attention(
         raise ValueError("give a mask or causal / block_causal, not both (fold them in)")
     out = _sm100_attention(q, k, v, scale, block, mask)
     return out if out.dtype == in_dtype else out.to(in_dtype)
+
+
+def attention_varlen(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    *,
+    causal: bool = False,
+    block_causal: int = 0,
+    scale: float | None = None,
+    plan: tuple | None = None,
+) -> Tensor:
+    """Variable-length attention over packed sequences, each its own problem (no padding
+    computed): ``q [Tq, H, D]``, ``k / v [Tk, Hkv, D]`` (fp16 / bf16), sequence ``b`` at
+    rows ``cu_seqlens[b] : cu_seqlens[b + 1]`` (int32 [B + 1]). ``causal`` /
+    ``block_causal`` apply within each sequence. ``plan``: ``varlen_plan(cu_seqlens_q,
+    cu_seqlens_k, H, Hkv, block)``, built once per batch of lengths (it reads the lengths
+    on the host), e.g. to keep the call free of host syncs inside a CUDA graph."""
+    if causal and block_causal not in (0, 1):
+        raise ValueError("causal is block_causal=1: give one of them")
+    block = 1 if causal else int(block_causal)
+    return _sm100_attention_varlen(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, scale=scale, block_causal=block, plan=plan
+    )
