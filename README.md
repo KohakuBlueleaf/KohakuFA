@@ -174,9 +174,9 @@ attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=No
 | dense, token causal, block causal, cross attention (`Sq != Skv`) | yes |
 | fp16 and bf16 compute; fp32 inputs (cast) | yes |
 | GQA / MQA (`k` / `v` with fewer heads) | yes |
-| head dim 64 | yes |
+| head dim 1 .. 64 (native 16 / 32 / 64, others zero-padded) | yes |
 | `torch.compile`, CUDA graphs | yes |
-| head dim 128 | next |
+| head dim up to 128 (forward fits; backward needs a split dK / dV + dQ kernel) | next |
 | boolean mask (broadcastable `[B, H, Sq, Skv]`, empty rows -> 0) | yes (hidden tiles skipped) |
 | variable length (packed sequences, `cu_seqlens`; no padding computed) | yes |
 | analytical block-size autotuner | planned |

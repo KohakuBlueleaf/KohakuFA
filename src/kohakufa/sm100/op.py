@@ -21,6 +21,8 @@ padded to 128 rows) and an fp32 dQ accumulator [B, H, Sq, D] while it runs.
 import torch
 from torch import Tensor
 
+KERNEL_DIMS = (16, 32, 64)  # head dims the kernels run at (others are padded up)
+
 from kohakufa.mask import PackedMask
 from kohakufa.sm100.bwd import (
     attention_backward,
@@ -33,8 +35,8 @@ from kohakufa.sm100.fwd import attention_forward, attention_forward_varlen, varl
 def _check(q: Tensor, k: Tensor, v: Tensor) -> None:
     if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
         raise TypeError("attention: q, k, v must be fp16 or bf16 (all the same)")
-    if q.shape[-1] != 64:
-        raise ValueError("attention: head_dim must be 64")
+    if q.shape[-1] not in KERNEL_DIMS:
+        raise ValueError(f"attention: kernel head_dim must be one of {KERNEL_DIMS}")
     if k.shape != v.shape or k.shape[0] != q.shape[0] or k.shape[-1] != q.shape[-1]:
         raise ValueError(
             f"attention: k {tuple(k.shape)} / v {tuple(v.shape)} vs q {tuple(q.shape)}"

@@ -354,3 +354,20 @@ def test_packed_mask_reuse():
             assert metrics(x, y)["rel_err"] < 1e-3, name
         else:
             assert metrics(x, y)["max_abs_err"] == 0.0, name
+
+
+@pytest.mark.parametrize("dim", [8, 16, 24, 32, 40, 48, 56, 64])
+@pytest.mark.parametrize("causal", [False, True])
+def test_head_dims(dim, causal):
+    """Any head dim up to 64: native at 16 / 32 / 64, zero-padded otherwise."""
+    gen = torch.Generator(device="cuda").manual_seed(dim)
+
+    def make(seq):
+        x = torch.randn(2, seq, 3, dim, device="cuda", generator=gen).half()
+        return x.transpose(1, 2).requires_grad_()
+
+    q, k, v = make(300), make(300), make(300)
+    dout = torch.randn(2, 3, 300, dim, device="cuda", generator=gen).half()
+    got = run(q, k, v, dout, causal=causal)
+    assert got[0].shape == (2, 3, 300, dim)
+    check(got, reference(q, k, v, dout, dim**-0.5, block=1 if causal else 0))

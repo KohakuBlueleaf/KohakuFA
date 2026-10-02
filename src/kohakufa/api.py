@@ -3,11 +3,28 @@
 import torch
 from torch import Tensor
 
+from kohakufa.sm100.op import (
+    KERNEL_DIMS,
+    varlen_plan,  # noqa: F401 (re-exported)
+)
 from kohakufa.sm100.op import attention as _sm100_attention
 from kohakufa.sm100.op import attention_varlen as _sm100_attention_varlen
-from kohakufa.sm100.op import varlen_plan  # noqa: F401 (re-exported)
 
 COMPUTE_DTYPES = (torch.float16, torch.bfloat16)
+MAX_HEAD_DIM = 64  # the fused backward's tensor-memory budget (see docs/head-dims.md)
+
+
+def _pad_head_dim(q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Any head dim up to MAX_HEAD_DIM: the kernels run at 16 / 32 / 64, so pad the last
+    dim with zeros (zero columns change neither q . k nor the output's first D columns;
+    the caller keeps the scale of the real D and slices the output)."""
+    dim = q.shape[-1]
+    if dim > MAX_HEAD_DIM or dim < 1:
+        raise ValueError(f"head_dim {dim}: 1 .. {MAX_HEAD_DIM} supported")
+    if dim in KERNEL_DIMS:
+        return q, k, v
+    padded = next(d for d in KERNEL_DIMS if d >= dim)
+    return tuple(torch.nn.functional.pad(t, (0, padded - dim)) for t in (q, k, v))
 
 
 def attention(
@@ -51,9 +68,13 @@ def attention(
         raise TypeError(f"compute_dtype {compute_dtype}: one of {COMPUTE_DTYPES}")
     in_dtype = q.dtype
     q, k, v = (t.to(compute_dtype) for t in (q, k, v))
+    dim = q.shape[-1]
+    if scale is None:
+        scale = dim**-0.5
+    q, k, v = _pad_head_dim(q, k, v)
     if mask is not None and block:
         raise ValueError("give a mask or causal / block_causal, not both (fold them in)")
-    out = _sm100_attention(q, k, v, scale, block, mask)
+    out = _sm100_attention(q, k, v, scale, block, mask)[..., :dim]
     return out if out.dtype == in_dtype else out.to(in_dtype)
 
 
@@ -78,6 +99,11 @@ def attention_varlen(
     if causal and block_causal not in (0, 1):
         raise ValueError("causal is block_causal=1: give one of them")
     block = 1 if causal else int(block_causal)
-    return _sm100_attention_varlen(
+    dim = q.shape[-1]
+    if scale is None:
+        scale = dim**-0.5
+    q, k, v = _pad_head_dim(q, k, v)
+    out = _sm100_attention_varlen(
         q, k, v, cu_seqlens_q, cu_seqlens_k, scale=scale, block_causal=block, plan=plan
     )
+    return out[..., :dim]
