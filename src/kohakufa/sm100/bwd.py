@@ -96,6 +96,12 @@ class Problem:
     dk_ptr: gl.tensor  # VARLEN: dK / dV, for row-masked stores at sequence ends
     dv_ptr: gl.tensor
     kv_row_stride: gl.tensor  # VARLEN: elements between packed K / V rows (Hkv * D)
+    list_start_ptr: gl.tensor  # MASK: per (batch * query head, key tile) list start,
+    list_count_ptr: gl.tensor  # ... and length, into
+    list_ptr: gl.tensor  # MASK: the query tiles a key tile visits (hidden ones skipped)
+    list_cls_ptr: gl.tensor  # MASK: per listed tile, 1 = every query sees every key
+    k_tiles: gl.tensor  # MASK: key tiles per (batch, query head)
+    list_rows: gl.tensor  # MASK: entries of list_start (clamp for look-ahead tiles)
     HEAD_DIM: gl.constexpr
     CAUSAL: gl.constexpr
     MASK: gl.constexpr
@@ -105,7 +111,8 @@ class Problem:
     def __init__(
         self, qk_scale, heads, group, seq_q, seq_kv, block, num_kv_tiles, num_tiles,
         mask_ptr, mask_b_stride, mask_h_stride, mask_words, stats_tiles, tiles_ptr,
-        cu_q_ptr, cu_k_ptr, cu_qt_ptr, dk_ptr, dv_ptr, kv_row_stride,
+        cu_q_ptr, cu_k_ptr, cu_qt_ptr, dk_ptr, dv_ptr, kv_row_stride, list_start_ptr,
+        list_count_ptr, list_ptr, list_cls_ptr, k_tiles, list_rows,
         HEAD_DIM, CAUSAL, MASK, VARLEN,
     ):  # fmt: skip
         self.qk_scale = qk_scale
@@ -128,6 +135,12 @@ class Problem:
         self.dk_ptr = dk_ptr
         self.dv_ptr = dv_ptr
         self.kv_row_stride = kv_row_stride
+        self.list_start_ptr = list_start_ptr
+        self.list_count_ptr = list_count_ptr
+        self.list_ptr = list_ptr
+        self.list_cls_ptr = list_cls_ptr
+        self.k_tiles = k_tiles
+        self.list_rows = list_rows
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
         self.CAUSAL = gl.constexpr(CAUSAL)
         self.MASK = gl.constexpr(MASK)
@@ -178,6 +191,42 @@ class Problem:
     def q_head(self, info, g):
         """Query head ``g`` (0 .. group - 1) of the tile's K / V head."""
         return info.head * self.group + g
+
+    @gluon.jit
+    def q_range(self, info, g):
+        """(start, count) of the query tiles query head ``g`` of the tile visits: a list
+        under MASK (hidden tiles skipped), else the contiguous first_q .. end_q."""
+        if self.MASK:
+            entry = (info.batch * self.heads + self.q_head(info, g)) * self.k_tiles
+            entry = gl.minimum(entry + info.kv_start // TILE, self.list_rows - 1)
+            return gl.load(self.list_start_ptr + entry), gl.load(self.list_count_ptr + entry)
+        else:
+            return info.first_q, info.end_q - info.first_q
+
+    @gluon.jit
+    def q_tile(self, start, index):
+        """The ``index``-th query tile of a ``q_range``."""
+        if self.MASK:
+            return gl.load(self.list_ptr + start + index)
+        else:
+            return start + index
+
+    @gluon.jit
+    def q_full(self, start, index):
+        """MASK: the ``index``-th listed query tile sees every key of the tile."""
+        return (gl.load(self.list_cls_ptr + start + index) & 1) != 0
+
+    @gluon.jit
+    def steps_of(self, info):
+        """Query steps of a tile over all of its query heads."""
+        if self.MASK:
+            n = info.kv_start * 0
+            for g in range(self.group):
+                _, count = self.q_range(info, g)
+                n += count
+            return n
+        else:
+            return (info.end_q - info.first_q) * self.group
 
 
 @aggregate
@@ -373,7 +422,9 @@ def _load_partition(k):
         tiles += 1  # noqa: SIM113 (Gluon has no enumerate)
         for g in range(p.group):
             q_head = p.q_head(info, g)
-            for i in range(info.first_q, info.end_q):
+            q_start, q_count = p.q_range(info, g)
+            for index in range(q_count):
+                i = p.q_tile(q_start, index)
                 slot = steps % QDO_SLOTS
                 _wait_free(bars.qdo_free.index(slot), steps // QDO_SLOTS)
                 ready = bars.qdo_ready.index(slot)
@@ -433,7 +484,7 @@ def _mma_partition(k):
     dq_count = 0
     for tile_id in range(gl.program_id(0), p.num_tiles, gl.num_programs(0)):
         info = p.tile(tile_id)
-        n = (info.end_q - info.first_q) * p.group  # every query head of the K / V head
+        n = p.steps_of(info)  # every query head of the K / V head
         kv_slot = tiles & 1
         _wait_ready(bars.kv_ready.index(kv_slot), tiles // 2)
         _issue_s(k, kv_slot, steps)
@@ -512,11 +563,19 @@ def _p_partition(k):
                 start = info.batch.to(gl.int64) * p.mask_b_stride
                 start += p.q_head(info, g).to(gl.int64) * p.mask_h_stride
                 rows = gl.minimum(keys, info.seq_kv - 1).to(gl.int64)
-                visibility = p.mask_ptr + start + rows * p.mask_words
+                words = p.mask_ptr + start + rows * p.mask_words
+                q_start, q_count = p.q_range(info, g)
+                for index in range(q_count):  # listed tiles: hidden ones are skipped
+                    i = p.q_tile(q_start, index)
+                    if p.q_full(q_start, index):
+                        steps = _p_step(k, words, key_ok, i, steps, regs, False)
+                    else:
+                        steps = _p_step(k, words, key_ok, i, steps, regs, True)
             else:
-                visibility = first_query
-            steps = _p_steps(k, visibility, key_ok, info.first_q, masked_end, steps, regs, True)
-            steps = _p_steps(k, visibility, key_ok, masked_end, info.end_q, steps, regs, False)
+                steps = _p_steps(
+                    k, first_query, key_ok, info.first_q, masked_end, steps, regs, True
+                )
+                steps = _p_steps(k, first_query, key_ok, masked_end, info.end_q, steps, regs, False)
 
 
 @gluon.jit
@@ -524,38 +583,44 @@ def _p_steps(k, first_query, key_ok, start, end, steps, regs: gl.constexpr, MASK
     """Query tiles ``start .. end - 1``; ``MASKED`` applies the block-causal mask (each
     key row's first visible query in ``first_query``) or, under MASK, the boolean mask
     (``first_query`` then points at each key row's words)."""
+    for i in range(start, end):
+        steps = _p_step(k, first_query, key_ok, i, steps, regs, MASKED)
+    return steps
+
+
+@gluon.jit
+def _p_step(k, first_query, key_ok, i, steps, regs: gl.constexpr, MASKED: gl.constexpr):
+    """P^T of query tile ``i`` (the CTA's ``steps``-th step) -> TMEM."""
     p, sm, bars, tm = k.problem, k.smem, k.bars, k.tmem
     NUM_CHUNKS: gl.constexpr = TILE // CHUNK
     col_layout: gl.constexpr = gl.SliceLayout(0, regs)
     offsets = gl.arange(0, CHUNK, layout=col_layout)
-    for i in range(start, end):
-        neg_m = sm.stats.index(STATS * (steps % QDO_SLOTS))
-        neg_log_l = sm.stats.index(STATS * (steps % QDO_SLOTS) + 1)
-        _wait_ready(bars.s_ready.index(0), steps)
-        probs = ()
-        for c in gl.static_range(NUM_CHUNKS):
-            s2 = float2.pack(tm.s.slice(c * CHUNK, CHUNK).load(regs), axis=1)
-            m = neg_m.slice(c * CHUNK, CHUNK).load(col_layout)
-            m2 = float2.pack(m[None, :].broadcast_to([TILE, CHUNK]), axis=1)
-            log_l = neg_log_l.slice(c * CHUNK, CHUNK).load(col_layout)
-            log_l2 = float2.pack(log_l[None, :].broadcast_to([TILE, CHUNK]), axis=1)
-            scale2 = float2.full_like(s2, p.qk_scale)
-            x2 = float2.fma(s2 + m2, scale2, log_l2)
-            prob = gl.exp2(float2.unpack(x2, axis=1))
-            if MASKED:
-                if p.MASK:  # CHUNK = 32 queries: one word per key row
-                    word = gl.load(first_query + (i * (TILE // CHUNK) + c))
-                    visible = (((word[:, None] >> offsets[None, :]) & 1) != 0) & key_ok[:, None]
-                else:
-                    queries = i * TILE + c * CHUNK + offsets
-                    visible = queries[None, :] >= first_query[:, None]
-                prob = gl.where(visible, prob, 0.0)
-            probs = probs + (prob.to(k.q_desc.block_type.element_ty),)
-        _wait_free(bars.p_read.index(0), steps)  # the dS warpgroup read P^T(i - 1)
-        tm.p.store(_join_columns(probs))
-        mbarrier.arrive(bars.p_ready.index(0), count=1)
-        steps += 1
-    return steps
+    neg_m = sm.stats.index(STATS * (steps % QDO_SLOTS))
+    neg_log_l = sm.stats.index(STATS * (steps % QDO_SLOTS) + 1)
+    _wait_ready(bars.s_ready.index(0), steps)
+    probs = ()
+    for c in gl.static_range(NUM_CHUNKS):
+        s2 = float2.pack(tm.s.slice(c * CHUNK, CHUNK).load(regs), axis=1)
+        m = neg_m.slice(c * CHUNK, CHUNK).load(col_layout)
+        m2 = float2.pack(m[None, :].broadcast_to([TILE, CHUNK]), axis=1)
+        log_l = neg_log_l.slice(c * CHUNK, CHUNK).load(col_layout)
+        log_l2 = float2.pack(log_l[None, :].broadcast_to([TILE, CHUNK]), axis=1)
+        scale2 = float2.full_like(s2, p.qk_scale)
+        x2 = float2.fma(s2 + m2, scale2, log_l2)
+        prob = gl.exp2(float2.unpack(x2, axis=1))
+        if MASKED:
+            if p.MASK:  # CHUNK = 32 queries: one word per key row
+                word = gl.load(first_query + (i * (TILE // CHUNK) + c))
+                visible = (((word[:, None] >> offsets[None, :]) & 1) != 0) & key_ok[:, None]
+            else:
+                queries = i * TILE + c * CHUNK + offsets
+                visible = queries[None, :] >= first_query[:, None]
+            prob = gl.where(visible, prob, 0.0)
+        probs = probs + (prob.to(k.q_desc.block_type.element_ty),)
+    _wait_free(bars.p_read.index(0), steps)  # the dS warpgroup read P^T(i - 1)
+    tm.p.store(_join_columns(probs))
+    mbarrier.arrive(bars.p_ready.index(0), count=1)
+    return steps + 1
 
 
 @gluon.jit
@@ -573,7 +638,7 @@ def _ds_partition(k):
     steps = 0
     for tile_id in range(gl.program_id(0), p.num_tiles, gl.num_programs(0)):
         info = p.tile(tile_id)
-        for _ in range((info.end_q - info.first_q) * p.group):  # every query head's steps
+        for _ in range(p.steps_of(info)):  # every query head's steps
             neg_delta = sm.stats.index(STATS * (steps % QDO_SLOTS) + 2)
             # all of dP^T(i) to registers first: its TMEM slot is free for dP^T(i + 1)
             _wait_ready(bars.dp_ready.index(0), steps)
@@ -626,7 +691,9 @@ def _reduce_partition(k):
         info = p.tile(tile_id)
         for g in range(p.group):
             q_head = p.q_head(info, g)
-            for i in range(info.first_q, info.end_q):
+            q_start, q_count = p.q_range(info, g)
+            for index in range(q_count):
+                i = p.q_tile(q_start, index)
                 _wait_ready(bars.dq_ready.index(0), dq_count)
                 dq_lo = tm.dq.slice(0, HALF_D).load(half_regs)
                 dq_hi = tm.dq.slice(HALF_D, HALF_D).load(half_regs)
@@ -701,7 +768,8 @@ def _barriers(n: gl.constexpr, count: gl.constexpr = 1):
 def attention_bwd_kernel(
     q_desc, k_desc, v_desc, do_desc, dk_desc, dv_desc, stats_desc, dq_desc, qk_scale, heads, group, seq_q, seq_kv, block, num_kv_tiles, num_tiles,
     mask_ptr, mask_b_stride, mask_h_stride, mask_words, stats_tiles, tiles_ptr, cu_q_ptr,
-    cu_k_ptr, cu_qt_ptr, dk_ptr, dv_ptr, kv_row_stride,
+    cu_k_ptr, cu_qt_ptr, dk_ptr, dv_ptr, kv_row_stride, list_start_ptr, list_count_ptr,
+    list_ptr, list_cls_ptr, k_tiles, list_rows,
     HEAD_DIM: gl.constexpr, CAUSAL: gl.constexpr, MASK: gl.constexpr, VARLEN: gl.constexpr,
 ):  # fmt: skip
     problem = Problem(
@@ -711,6 +779,8 @@ def attention_bwd_kernel(
         gl.to_tensor(num_tiles), mask_ptr, gl.to_tensor(mask_b_stride),
         gl.to_tensor(mask_h_stride), gl.to_tensor(mask_words), gl.to_tensor(stats_tiles),
         tiles_ptr, cu_q_ptr, cu_k_ptr, cu_qt_ptr, dk_ptr, dv_ptr, gl.to_tensor(kv_row_stride),
+        list_start_ptr, list_count_ptr, list_ptr, list_cls_ptr, gl.to_tensor(k_tiles),
+        gl.to_tensor(list_rows),
         HEAD_DIM, CAUSAL, MASK, VARLEN,
     )  # fmt: skip
     box: gl.constexpr = [1, 1, TILE, HEAD_DIM]
@@ -831,6 +901,7 @@ def attention_backward(
     scale: float,
     block: int,
     mask_words_t: torch.Tensor | None = None,
+    mask_lists_t: tuple | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gradients of ``attention_forward``: dq, dk, dv as [B, H, S, D] views of
     [B, S, H, D] storage. Extra memory: (-m, -log2 l, -delta) per row (fp32) and the fp32 dQ
@@ -880,7 +951,7 @@ def attention_backward(
         stats_desc, dq_desc, scale * LOG2E, heads, heads // kv_heads, seq_q, seq_kv,
         max(block, 1),
         num_kv_tiles, num_tiles, *mask_arguments(mask_words_t, device), num_q_tiles,
-        *_no_varlen(device),
+        *_no_varlen(device), *(mask_lists_t or _no_lists(device)),
         HEAD_DIM=dim, CAUSAL=block > 0, MASK=mask_words_t is not None, VARLEN=False,
         num_warps=4,
     )  # fmt: skip
@@ -892,6 +963,12 @@ def attention_backward(
         dq.stride(0), dq.stride(1), dq.stride(2), D=dim, BLOCK=64,
     )  # fmt: skip
     return dq, dk, dv
+
+
+def _no_lists(device) -> tuple:
+    """Dummy MASK tile lists (start, count, list, classes, key tiles, list rows)."""
+    dummy = torch.zeros(1, dtype=torch.int32, device=device)
+    return dummy, dummy, dummy, dummy, 1, 1
 
 
 def _no_varlen(device) -> tuple:
@@ -1015,6 +1092,7 @@ def attention_backward_varlen(
             stats_desc, dq_desc, scale * LOG2E, heads, heads // kv_heads, total_q, total_k,
             max(block, 1), 1, num_tiles, *mask_arguments(None, device), total_q_tiles,
             key_tiles, cu_seqlens_q, cu_seqlens_k, cu_qt, dk, dv, kv_heads * dim,
+            *_no_lists(device),
             HEAD_DIM=dim, CAUSAL=block > 0, MASK=False, VARLEN=True, num_warps=4,
         )  # fmt: skip
     dq = torch.empty_like(q)

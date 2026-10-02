@@ -102,11 +102,10 @@ sequences (`benchmarks/features.py`), each against the kernels that support it:
   with FA4 beyond.
 * **Varlen:** faster than FA4's varlen forward at every length (1030 vs 855 TFLOPS at 8k);
   fwd+bwd ahead up to 4k and ~6% behind at 16k.
-* **Boolean mask:** the forward skips hidden tiles and runs fully visible ones unmasked
-  (tile lists built when the mask is packed). With the mask packed once (`pack_mask`, reused
-  across layers), a key-padding mask runs at 866 to 931 TFLOPS forward (flex: ~390). The plot
-  above still shows the per-call packing cost, which dominated; the backward does not skip
-  tiles yet (452 to 513 TFLOPS fwd+bwd), so that is the next item.
+* **Boolean mask:** forward and backward skip hidden tiles and run fully visible ones unmasked
+  (tile lists built when the mask is packed; `pack_mask` packs once for reuse across layers).
+  Key padding at 16k: 927 TFLOPS forward and 815 TFLOPS fwd+bwd, against ~400 for flex
+  attention's block mask and ~200 for cuDNN with a mask.
 
 The precision sweep in bf16 is in [precision_rel_err (bf16)](docs/images/precision_rel_err_j3e-2_bf16.png):
 the same picture as fp16, one step coarser.
@@ -178,7 +177,7 @@ attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=No
 | head dim 64 | yes |
 | `torch.compile`, CUDA graphs | yes |
 | head dim 128 | next |
-| boolean mask (broadcastable `[B, H, Sq, Skv]`, empty rows -> 0) | yes (forward skips hidden tiles; backward next) |
+| boolean mask (broadcastable `[B, H, Sq, Skv]`, empty rows -> 0) | yes (hidden tiles skipped) |
 | variable length (packed sequences, `cu_seqlens`; no padding computed) | yes |
 | analytical block-size autotuner | planned |
 | sm_120 | planned |

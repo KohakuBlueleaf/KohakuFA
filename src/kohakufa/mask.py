@@ -91,6 +91,8 @@ class PackedMask:
         self.words = pack_rows(dense)
         self.words_t = pack_rows(dense.transpose(-1, -2))
         self.lists = tile_lists(dense, batch, heads, 256, TILE)[:4]
+        # the backward walks query tiles per key tile: the transposed lists
+        self.lists_t = tile_lists(dense.transpose(-1, -2), batch, heads, TILE, TILE)[:4]
 
 
 def pack_mask(mask: Tensor, batch: int, heads: int, s_q: int, s_kv: int) -> PackedMask:

@@ -16,7 +16,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask
 
 import kernels as K
-from kohakufa import attention, attention_varlen, varlen_plan
+from kohakufa import attention, attention_varlen, pack_mask, varlen_plan
 from speed import time_ms
 
 HEADS, DIM, TOKENS = 16, 64, 32768
@@ -112,7 +112,8 @@ def padding_benches(writer, seq, gen):
     ):
         return K._flex(a, b, c, block_mask=block_mask)
 
-    benches = {"KohakuFA (mask)": lambda a, b, c: attention(a, b, c, mask=mask),
+    packed = pack_mask(mask, batch, HEADS, seq, seq)  # once, like flex's block mask
+    benches = {"KohakuFA (mask)": lambda a, b, c: attention(a, b, c, mask=packed),
                "cuDNN (SDPA)": sdpa(SDPBackend.CUDNN_ATTENTION),
                "mem-efficient (SDPA)": sdpa(SDPBackend.EFFICIENT_ATTENTION),
                "flex": flex_fn}  # fmt: skip

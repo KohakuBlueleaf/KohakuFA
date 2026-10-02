@@ -59,6 +59,10 @@ def attention_fwd_op(
     list_count: Tensor | None,
     list_entries: Tensor | None,
     list_classes: Tensor | None,
+    list_start_t: Tensor | None,
+    list_count_t: Tensor | None,
+    list_entries_t: Tensor | None,
+    list_classes_t: Tensor | None,
 ) -> tuple[Tensor, Tensor]:
     lists = None
     if list_start is not None:
@@ -86,12 +90,21 @@ def attention_bwd_op(
     scale: float,
     block: int,
     mask_words_t: Tensor | None,
+    list_start_t: Tensor | None,
+    list_count_t: Tensor | None,
+    list_entries_t: Tensor | None,
+    list_classes_t: Tensor | None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    return attention_backward(q, k, v, out, dout, lse, scale, block, mask_words_t)
+    lists_t = None
+    if list_start_t is not None:
+        rows = list_start_t.numel()
+        k_tiles = rows // (q.shape[0] * q.shape[1])
+        lists_t = (list_start_t, list_count_t, list_entries_t, list_classes_t, k_tiles, rows)
+    return attention_backward(q, k, v, out, dout, lse, scale, block, mask_words_t, lists_t)
 
 
 @attention_bwd_op.register_fake
-def _(q, k, v, out, dout, lse, scale, block, mask_words_t):
+def _(q, k, v, out, dout, lse, scale, block, mask_words_t, *lists_t):
     def like(t):
         batch, heads, seq, dim = t.shape
         return t.new_empty(batch, seq, heads, dim).transpose(1, 2)
@@ -102,18 +115,20 @@ def _(q, k, v, out, dout, lse, scale, block, mask_words_t):
 def _setup_context(ctx, inputs, output):
     q, k, v, scale, block, _, mask_words_t, *_ = inputs
     out, lse = output
-    ctx.save_for_backward(q, k, v, out, lse, mask_words_t)
+    ctx.save_for_backward(q, k, v, out, lse, mask_words_t, *inputs[11:15])
     ctx.scale = scale
     ctx.block = block
     ctx.mark_non_differentiable(lse)
 
 
 def _backward(ctx, dout, dlse):
-    q, k, v, out, lse, mask_words_t = ctx.saved_tensors
+    q, k, v, out, lse, mask_words_t, *lists_t = ctx.saved_tensors
     if dout.stride(-1) != 1 or any((s * 2) % 16 for s in dout.stride()[:-1]):
         dout = dout.contiguous()
-    dq, dk, dv = attention_bwd_op(q, k, v, out, dout, lse, ctx.scale, ctx.block, mask_words_t)
-    return dq, dk, dv, None, None, None, None, None, None, None, None
+    dq, dk, dv = attention_bwd_op(
+        q, k, v, out, dout, lse, ctx.scale, ctx.block, mask_words_t, *lists_t
+    )
+    return (dq, dk, dv) + (None,) * 12
 
 
 attention_fwd_op.register_autograd(_backward, setup_context=_setup_context)
@@ -135,7 +150,7 @@ def attention(
     if scale is None:
         scale = q.shape[-1] ** -0.5
     words = words_t = None
-    lists = (None,) * 4
+    lists = lists_t = (None,) * 4
     if mask is not None:
         if block_causal:
             raise ValueError("attention: give a mask or block_causal, not both (fold it in)")
@@ -143,8 +158,11 @@ def attention(
         packed = mask if isinstance(mask, PackedMask) else PackedMask(mask, *shape)
         if packed.shape != shape:
             raise ValueError(f"packed mask for {packed.shape}, inputs are {shape}")
-        words, words_t, lists = packed.words, packed.words_t, packed.lists
-    out, _ = attention_fwd_op(q, k, v, float(scale), int(block_causal), words, words_t, *lists)
+        words, words_t = packed.words, packed.words_t
+        lists, lists_t = packed.lists, packed.lists_t
+    out, _ = attention_fwd_op(
+        q, k, v, float(scale), int(block_causal), words, words_t, *lists, *lists_t
+    )
     return out
 
 
