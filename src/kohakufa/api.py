@@ -4,26 +4,28 @@ import torch
 from torch import Tensor
 
 from kohakufa.sm100.op import (
-    KERNEL_DIMS,
+    KERNEL_DIM_STEP,
+    MAX_KERNEL_DIM,
     varlen_plan,  # noqa: F401 (re-exported)
 )
 from kohakufa.sm100.op import attention as _sm100_attention
 from kohakufa.sm100.op import attention_varlen as _sm100_attention_varlen
 
 COMPUTE_DTYPES = (torch.float16, torch.bfloat16)
-MAX_HEAD_DIM = 64  # the fused backward's tensor-memory budget (see docs/head-dims.md)
+MAX_HEAD_DIM = MAX_KERNEL_DIM
 
 
 def _pad_head_dim(q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    """Any head dim up to MAX_HEAD_DIM: the kernels run at 16 / 32 / 64, so pad the last
-    dim with zeros (zero columns change neither q . k nor the output's first D columns;
-    the caller keeps the scale of the real D and slices the output)."""
+    """Any head dim up to MAX_HEAD_DIM: the kernels run at multiples of 16 (head-dim
+    chunks of 64 / 32 / 16), so pad the last dim to one with zeros (zero columns change
+    neither q . k nor the output's first D columns; the caller keeps the scale of the
+    real D and slices the output)."""
     dim = q.shape[-1]
     if dim > MAX_HEAD_DIM or dim < 1:
         raise ValueError(f"head_dim {dim}: 1 .. {MAX_HEAD_DIM} supported")
-    if dim in KERNEL_DIMS:
+    if dim % KERNEL_DIM_STEP == 0:
         return q, k, v
-    padded = next(d for d in KERNEL_DIMS if d >= dim)
+    padded = -(-dim // KERNEL_DIM_STEP) * KERNEL_DIM_STEP
     return tuple(torch.nn.functional.pad(t, (0, padded - dim)) for t in (q, k, v))
 
 

@@ -1,10 +1,10 @@
 """Forward and forward + backward time of every kernel over sequence length, for dense,
-token-causal and block-causal attention (fp16, head_dim 64, 16 heads, a fixed number of
+token-causal and block-causal attention (fp16, head_dim 64 or --dim, 16 heads, a fixed number of
 tokens per call so every length does comparable work). Timed inside CUDA graphs (no
 launch overhead; eager timing if a kernel cannot be captured, flagged in the CSV).
 
     python benchmarks/speed.py --out benchmarks/results
-Writes speed.csv: mode, seq, kernel, pass, ms, tflops, graph.
+Writes speed.csv (speed_d{D}.csv for --dim D != 64): mode, seq, kernel, pass, ms, tflops, graph.
 """
 
 import argparse
@@ -61,12 +61,12 @@ def time_ms(fn, iters=20):
     return best, captured
 
 
-def inputs(seq):
+def inputs(seq, dim):
     batch = max(1, TOKENS // seq)
     gen = torch.Generator(device="cuda").manual_seed(0)
 
     def projection():  # [B, S, H, D] storage viewed as [B, H, S, D], as models make them
-        x = torch.randn(batch, seq, HEADS, DIM, device="cuda", generator=gen, dtype=torch.half)
+        x = torch.randn(batch, seq, HEADS, dim, device="cuda", generator=gen, dtype=torch.half)
         return x.transpose(1, 2)
 
     return projection(), projection(), projection(), batch
@@ -76,18 +76,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="benchmarks/results")
     parser.add_argument("--seqs", default="256,512,1024,2048,4096,8192,16384")
+    parser.add_argument("--dim", type=int, default=DIM)
+    parser.add_argument("--modes", default="dense,causal,block")
     args = parser.parse_args()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    file = open(out_dir / "speed.csv", "w", newline="")
+    name = "speed.csv" if args.dim == DIM else f"speed_d{args.dim}.csv"
+    file = open(out_dir / name, "w", newline="")
     writer = csv.DictWriter(
         file, fieldnames=["mode", "seq", "kernel", "pass", "ms", "tflops", "graph"]
     )
     writer.writeheader()
-    for mode in ("dense", "causal", "block"):
+    for mode in args.modes.split(","):
         for seq in (int(s) for s in args.seqs.split(",")):
-            q, k, v, batch = inputs(seq)
-            flops = 4 * batch * HEADS * seq * seq * DIM * visible_fraction(seq, mode)
+            q, k, v, batch = inputs(seq, args.dim)
+            flops = 4 * batch * HEADS * seq * seq * args.dim * visible_fraction(seq, mode)
             dout = torch.randn_like(q)
             for name, (fn, modes) in KERNELS.items():
                 if mode not in modes:

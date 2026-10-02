@@ -75,3 +75,71 @@ def forward_config(head_dim: int, elem_bytes: int = 2) -> ForwardConfig:
         if cfg.kv_buffers <= 6:
             return cfg
     raise ValueError(f"head dim {head_dim}: no forward configuration fits one SM")
+
+
+TILE = 128  # backward: keys per CTA tile = query rows per step
+REDUCE_COLS = 32  # backward: fp32 dQ columns per TMA reduce-add (staging [TILE, 32])
+
+
+@dataclasses.dataclass(frozen=True)
+class BackwardConfig:
+    """``dc`` x ``nch`` = head dim. ``alias``: P^T shares the S^T columns and dQ the dP^T
+    columns (FA4's layout; needed above D = 64, at the price of dP^T(i + 1) waiting for
+    dQ(i) to be read out). ``kv_bufs`` K / V tiles (2: the next tile loads during this
+    one); ``q_slots`` / ``do_slots`` Q (+ statistics) and dO buffers (the loads run that
+    many steps ahead)."""
+
+    dc: int
+    nch: int
+    alias: bool
+    kv_bufs: int
+    q_slots: int
+    do_slots: int
+
+    @property
+    def head_dim(self) -> int:
+        return self.dc * self.nch
+
+    def tmem_columns(self) -> int:
+        scores = 2 * TILE  # S^T, dP^T
+        if self.alias:
+            return scores + 2 * self.head_dim  # dV, dK (P^T in S^T, dQ in dP^T)
+        return scores + TILE // 2 + 3 * self.head_dim  # P^T (16-bit), dV, dK, dQ
+
+    def smem_bytes(self, elem_bytes: int = 2) -> int:
+        tiles = (2 * self.kv_bufs + self.q_slots + self.do_slots) * TILE * self.head_dim
+        ds = TILE * TILE  # dS^T
+        staging = TILE * min(self.dc, REDUCE_COLS) * 4
+        stats = 3 * self.q_slots * TILE * 4
+        return (tiles + ds) * elem_bytes + staging + stats + SMEM_RESERVED
+
+    def legal(self, elem_bytes: int = 2) -> bool:
+        # the 3D aliased dQ view needs D <= 128 (it lives in the 128 dP^T columns)
+        if self.alias and self.head_dim > TILE:
+            return False
+        return (
+            self.tmem_columns() <= TMEM_COLUMNS
+            and self.smem_bytes(elem_bytes) <= SMEM_BYTES
+            and 1 <= self.do_slots <= self.q_slots
+        )
+
+
+def backward_configs(head_dim: int, elem_bytes: int = 2):
+    """Every legal backward configuration for ``head_dim``, in default preference order:
+    no aliasing, then Q at least double-buffered (the loads run ahead), double-buffered
+    K / V, deeper Q, then dO buffering."""
+    dc = chunk_of(head_dim)
+    buffering = ((2, 3), (1, 3), (2, 2), (1, 2), (2, 1), (1, 1))  # (kv_bufs, q_slots)
+    for alias in (False, True):
+        for kv_bufs, q_slots in buffering:
+            for do_slots in range(q_slots, 0, -1):
+                cfg = BackwardConfig(dc, head_dim // dc, alias, kv_bufs, q_slots, do_slots)
+                if cfg.legal(elem_bytes):
+                    yield cfg
+
+
+def backward_config(head_dim: int, elem_bytes: int = 2) -> BackwardConfig:
+    """Default backward configuration (the first legal one, see ``backward_configs``)."""
+    for cfg in backward_configs(head_dim, elem_bytes):
+        return cfg
+    raise ValueError(f"head dim {head_dim}: no backward configuration fits one SM")

@@ -268,23 +268,23 @@ def test_mask_gqa_bf16():
     check(got, reference(q, k, v, dout, 64**-0.5, groups=4, mask=mask), tol=BF16_TOL)
 
 
-def packed(lengths, heads, kv_heads, dtype=torch.float16, seed=4):
+def packed(lengths, heads, kv_heads, dtype=torch.float16, seed=4, dim=64):
     """Packed q [T, H, D], k / v [T, Hkv, D], dout, and cu_seqlens."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     total = sum(lengths)
     cu = torch.tensor([0] + list(torch.tensor(lengths).cumsum(0)), dtype=torch.int32, device="cuda")
 
     def make(h):
-        return torch.randn(total, h, 64, device="cuda", generator=gen).to(dtype).requires_grad_()
+        return torch.randn(total, h, dim, device="cuda", generator=gen).to(dtype).requires_grad_()
 
-    dout = torch.randn(total, heads, 64, device="cuda", generator=gen).to(dtype)
+    dout = torch.randn(total, heads, dim, device="cuda", generator=gen).to(dtype)
     return make(heads), make(kv_heads), make(kv_heads), dout, cu
 
 
-def check_varlen(lengths, heads, kv_heads, block, dtype=torch.float16, tol=TOL):
+def check_varlen(lengths, heads, kv_heads, block, dtype=torch.float16, tol=TOL, dim=64):
     from kohakufa import attention_varlen
 
-    q, k, v, dout, cu = packed(lengths, heads, kv_heads, dtype)
+    q, k, v, dout, cu = packed(lengths, heads, kv_heads, dtype, dim=dim)
     out = attention_varlen(q, k, v, cu, cu, block_causal=block)
     out.backward(dout)
     for b in range(len(lengths)):
@@ -293,7 +293,7 @@ def check_varlen(lengths, heads, kv_heads, block, dtype=torch.float16, tol=TOL):
         def view(t, s=s, e=e):
             return t[s:e].unsqueeze(0).transpose(1, 2)
 
-        want = reference(view(q), view(k), view(v), view(dout), 64**-0.5, block=block,
+        want = reference(view(q), view(k), view(v), view(dout), dim**-0.5, block=block,
                          groups=heads // kv_heads)  # fmt: skip
         got = (view(out), view(q.grad), view(k.grad), view(v.grad))
         check(got, want, tol=tol)
@@ -356,10 +356,12 @@ def test_packed_mask_reuse():
             assert metrics(x, y)["max_abs_err"] == 0.0, name
 
 
-@pytest.mark.parametrize("dim", [8, 16, 24, 32, 40, 48, 56, 64])
+@pytest.mark.parametrize("dim", [8, 16, 24, 40, 64, 72, 80, 96, 112, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_head_dims(dim, causal):
-    """Any head dim up to 64: native at 16 / 32 / 64, zero-padded otherwise."""
+    """Any head dim up to 128: native at multiples of 16 (head-dim chunks of 64 / 32 /
+    16; above 64 the backward's P^T / dQ share tensor memory with S^T / dP^T),
+    zero-padded to one otherwise."""
     gen = torch.Generator(device="cuda").manual_seed(dim)
 
     def make(seq):
@@ -371,3 +373,34 @@ def test_head_dims(dim, causal):
     got = run(q, k, v, dout, causal=causal)
     assert got[0].shape == (2, 3, 300, dim)
     check(got, reference(q, k, v, dout, dim**-0.5, block=1 if causal else 0))
+
+
+@pytest.mark.parametrize("dim", [96, 128])
+def test_wide_heads_features(dim):
+    """The aliased (D > 64) backward with block-causal GQA, a boolean mask in bf16, and
+    varlen."""
+    q, k, v, dout = inputs(2, 8, 269, 517, dim=dim, kv_heads=2)
+    got = run(q, k, v, dout, block_causal=24)
+    check(got, reference(q, k, v, dout, dim**-0.5, block=24, groups=4))
+    q, k, v, dout = inputs(2, 4, 269, 269, dim=dim, dtype=torch.bfloat16, kv_heads=2)
+    mask = random_mask((2, 4, 269, 269), 0.5)
+    got = run(q, k, v, dout, mask=mask)
+    check(got, reference(q, k, v, dout, dim**-0.5, groups=2, mask=mask), tol=BF16_TOL)
+    check_varlen([1, 77, 512, 3, 300], 4, 2, 1, dim=dim)
+
+
+def test_wide_heads_huge_logits():
+    """Bugs 1 to 3 stay fixed on the aliased backward (D = 128)."""
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    centers = torch.randn(1, 2, 8, 128, device="cuda", generator=gen)
+    pick = torch.randint(0, 8, (1, 2, 269), device="cuda", generator=gen)
+    base = torch.gather(centers, 2, pick[..., None].expand(-1, -1, -1, 128))
+    q = 300 * (base + 1e-3 * torch.randn(base.shape, device="cuda", generator=gen))
+    k = 300 * (base + 1e-3 * torch.randn(base.shape, device="cuda", generator=gen))
+    v = torch.randn(base.shape, device="cuda", generator=gen)
+    q, k, v = (t.half().requires_grad_() for t in (q, k, v))
+    dout = torch.randn(base.shape, device="cuda", generator=gen).half()
+    got = run(q, k, v, dout, causal=True)
+    want = reference(q, k, v, dout, 128**-0.5, block=1)
+    for name, g, w, bound in zip(("dk", "dv"), got[2:], want[2:], (0.995, 0.9999)):
+        assert metrics(g, w)["cos"] > bound, name
