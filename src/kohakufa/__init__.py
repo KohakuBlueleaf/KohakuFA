@@ -7,6 +7,7 @@ See README.md for what is supported and docs/precision.md for the numerics.
 """
 
 from kohakufa.api import attention, attention_varlen, varlen_plan
+from kohakufa.mask import PackedMask, pack_mask
 
-__all__ = ["attention", "attention_varlen", "varlen_plan"]
+__all__ = ["PackedMask", "attention", "attention_varlen", "pack_mask", "varlen_plan"]
 __version__ = "0.1.0"

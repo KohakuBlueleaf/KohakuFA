@@ -16,12 +16,13 @@ The short version of what this repository found: **"fp16 training is unstable" w
 fault, it was the attention kernel's.** The details are in [docs/precision.md](docs/precision.md).
 
 ```python
-from kohakufa import attention, attention_varlen
+from kohakufa import attention, attention_varlen, pack_mask
 
 out = attention(q, k, v)                     # dense,  q / k / v [B, H, S, D]
 out = attention(q, k, v, causal=True)        # token causal
 out = attention(q, k, v, block_causal=256)   # frame-causal: frames of 256 tokens
 out = attention(q, k, v, mask=mask)          # any boolean mask, True = visible
+packed = pack_mask(mask, B, H, Sq, Skv)      # pack once, reuse across layers / calls
 
 # packed variable-length sequences: q [Tq, H, D], k / v [Tk, Hkv, D]
 out = attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal=True)
@@ -101,10 +102,11 @@ sequences (`benchmarks/features.py`), each against the kernels that support it:
   with FA4 beyond.
 * **Varlen:** faster than FA4's varlen forward at every length (1030 vs 855 TFLOPS at 8k);
   fwd+bwd ahead up to 4k and ~6% behind at 16k.
-* **Boolean mask: slow today.** v1 runs every key tile on the masked path and skips nothing,
-  so a key-padding mask runs at ~75 TFLOPS forward against ~390 for flex attention's block
-  mask. Tile classification (skip hidden tiles, unmasked path for fully visible ones) is the
-  next item; for padding, `attention_varlen` on the packed sequences is the fast path today.
+* **Boolean mask:** the forward skips hidden tiles and runs fully visible ones unmasked
+  (tile lists built when the mask is packed). With the mask packed once (`pack_mask`, reused
+  across layers), a key-padding mask runs at 866 to 931 TFLOPS forward (flex: ~390). The plot
+  above still shows the per-call packing cost, which dominated; the backward does not skip
+  tiles yet (452 to 513 TFLOPS fwd+bwd), so that is the next item.
 
 The precision sweep in bf16 is in [precision_rel_err (bf16)](docs/images/precision_rel_err_j3e-2_bf16.png):
 the same picture as fp16, one step coarser.
@@ -176,7 +178,7 @@ attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=No
 | head dim 64 | yes |
 | `torch.compile`, CUDA graphs | yes |
 | head dim 128 | next |
-| boolean mask (broadcastable `[B, H, Sq, Skv]`, empty rows -> 0) | yes (v1: every tile on the masked path; tile skipping next) |
+| boolean mask (broadcastable `[B, H, Sq, Skv]`, empty rows -> 0) | yes (forward skips hidden tiles; backward next) |
 | variable length (packed sequences, `cu_seqlens`; no padding computed) | yes |
 | analytical block-size autotuner | planned |
 | sm_120 | planned |

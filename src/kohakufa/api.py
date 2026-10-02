@@ -32,7 +32,8 @@ def attention(
         block_causal: frame size ``P > 0``: query ``r`` sees keys of frames up to its
             own, ``c // P <= r // P``. ``causal`` is ``block_causal=1``.
         scale: softmax scale, ``D ** -0.5`` by default.
-        mask: bool, broadcastable to ``[B, H, Sq, Skv]``, True = visible (exclusive with
+        mask: bool, broadcastable to ``[B, H, Sq, Skv]``, True = visible, or a
+            ``pack_mask(...)`` result to reuse one packing across calls (exclusive with
             ``causal`` / ``block_causal``: fold those into the mask). A query row that
             sees no key outputs 0 and gets zero gradients.
         compute_dtype: tensor-core operand dtype; inputs of another dtype (e.g. fp32)

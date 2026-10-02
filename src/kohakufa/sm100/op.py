@@ -21,7 +21,7 @@ padded to 128 rows) and an fp32 dQ accumulator [B, H, Sq, D] while it runs.
 import torch
 from torch import Tensor
 
-from kohakufa.mask import pack
+from kohakufa.mask import PackedMask
 from kohakufa.sm100.bwd import (
     attention_backward,
     attention_backward_varlen,
@@ -55,12 +55,20 @@ def attention_fwd_op(
     block: int,
     mask_words: Tensor | None,
     mask_words_t: Tensor | None,
+    list_start: Tensor | None,
+    list_count: Tensor | None,
+    list_entries: Tensor | None,
+    list_classes: Tensor | None,
 ) -> tuple[Tensor, Tensor]:
-    return attention_forward(q, k, v, scale, block, mask_words)
+    lists = None
+    if list_start is not None:
+        q_tiles = list_start.numel() // (q.shape[0] * q.shape[1])
+        lists = (list_start, list_count, list_entries, list_classes, q_tiles)
+    return attention_forward(q, k, v, scale, block, mask_words, lists)
 
 
 @attention_fwd_op.register_fake
-def _(q, k, v, scale, block, mask_words, mask_words_t):
+def _(q, k, v, scale, block, mask_words, mask_words_t, *lists):
     batch, heads, seq_q, dim = q.shape
     out = q.new_empty(batch, seq_q, heads, dim).transpose(1, 2)
     lse = q.new_empty(batch, heads, 2, seq_q, dtype=torch.float32)
@@ -92,7 +100,7 @@ def _(q, k, v, out, dout, lse, scale, block, mask_words_t):
 
 
 def _setup_context(ctx, inputs, output):
-    q, k, v, scale, block, _, mask_words_t = inputs
+    q, k, v, scale, block, _, mask_words_t, *_ = inputs
     out, lse = output
     ctx.save_for_backward(q, k, v, out, lse, mask_words_t)
     ctx.scale = scale
@@ -105,7 +113,7 @@ def _backward(ctx, dout, dlse):
     if dout.stride(-1) != 1 or any((s * 2) % 16 for s in dout.stride()[:-1]):
         dout = dout.contiguous()
     dq, dk, dv = attention_bwd_op(q, k, v, out, dout, lse, ctx.scale, ctx.block, mask_words_t)
-    return dq, dk, dv, None, None, None, None
+    return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
 attention_fwd_op.register_autograd(_backward, setup_context=_setup_context)
@@ -127,11 +135,16 @@ def attention(
     if scale is None:
         scale = q.shape[-1] ** -0.5
     words = words_t = None
+    lists = (None,) * 4
     if mask is not None:
         if block_causal:
             raise ValueError("attention: give a mask or block_causal, not both (fold it in)")
-        words, words_t = pack(mask, q.shape[0], q.shape[1], q.shape[2], k.shape[2])
-    out, _ = attention_fwd_op(q, k, v, float(scale), int(block_causal), words, words_t)
+        shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
+        packed = mask if isinstance(mask, PackedMask) else PackedMask(mask, *shape)
+        if packed.shape != shape:
+            raise ValueError(f"packed mask for {packed.shape}, inputs are {shape}")
+        words, words_t, lists = packed.words, packed.words_t, packed.lists
+    out, _ = attention_fwd_op(q, k, v, float(scale), int(block_causal), words, words_t, *lists)
     return out
 
 

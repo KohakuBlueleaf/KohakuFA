@@ -338,3 +338,19 @@ def test_varlen_cuda_graph():
     torch.cuda.synchronize()
     eager = attention_varlen(*(t.detach() for t in (q, k, v)), cu, cu, causal=True)
     assert metrics(out, eager)["rel_err"] < 1e-6
+
+
+def test_packed_mask_reuse():
+    """pack_mask once, reuse across calls: identical to passing the bool mask."""
+    from kohakufa import pack_mask
+
+    q, k, v, dout = inputs(2, 3, 600, 600)
+    mask = random_mask((2, 1, 600, 600), 0.4)
+    packed = pack_mask(mask, 2, 3, 600, 600)
+    a = run(q, k, v, dout, mask=packed)
+    b = run(q, k, v, dout, mask=mask)
+    for name, x, y in zip(("out", "dq", "dk", "dv"), a, b):
+        if name == "dq":  # dQ is reduced in arbitrary order (TMA reduce-add)
+            assert metrics(x, y)["rel_err"] < 1e-3, name
+        else:
+            assert metrics(x, y)["max_abs_err"] == 0.0, name
