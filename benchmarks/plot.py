@@ -11,6 +11,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+matplotlib.rcParams["font.size"] = 13
 import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 
@@ -82,7 +83,7 @@ def precision_figures(rows, out, tag):
                     ax.set_xlabel("largest |logit|")
                 if c == 0:
                     ax.set_ylabel(label)
-        axes[0, 0].legend(fontsize=8)
+        axes[0, 0].legend(fontsize=12)
         fig.suptitle(
             f"Error against fp64 on the same fp16 inputs ({label.split('  ')[0]}); lower is better"
         )
@@ -111,7 +112,7 @@ def violin_figure(per_row, out, tag):
             ax.set_xticks(
                 range(1, len(names) + 1),
                 [n.replace(" (SDPA", "\n(SDPA") for n in names],
-                fontsize=7,
+                fontsize=10,
             )
             ax.set_ylabel("log10 per-row relative error")
             ax.set_title(f"{mode}, |logit| ~ {scale:.0e}: {tensor} rows")
@@ -169,14 +170,14 @@ def speed_figures(rows, out):
                 suffix = " (vs FA2 dense)" if mode == "block" and kind == "speedup" else ""
                 ax.set_title(f"{titles[mode]}: {pass_}{suffix}")
                 if r == 1:
-                    ax.set_xlabel("sequence length (tokens per call fixed at 32k, 16 heads, d=64)")
-        axes[0, 0].legend(fontsize=8)
+                    ax.set_xlabel("sequence length")
+        axes[0, 0].legend(fontsize=12)
         what = {
             "speedup": "speedup over PyTorch SDPA flash (FA2), higher is better",
             "tflops": "effective TFLOPS (visible FLOPs only), higher is better",
             "time": "time per call, lower is better",
         }[kind]
-        fig.suptitle(f"B300, fp16: {what}")
+        fig.suptitle(f"B300, fp16, D = 64, 16 heads, 32k tokens per call: {what}")
         fig.tight_layout()
         fig.savefig(out / f"speed_{kind}.png", dpi=130)
         plt.close(fig)
@@ -184,11 +185,10 @@ def speed_figures(rows, out):
 
 def features_figure(rows, out):
     benches = list(dict.fromkeys(r["bench"] for r in rows))
-    titles = {"bf16 dense": "bf16, dense", "bf16 causal": "bf16, token causal",
-              "gqa 16/4": "GQA, 16 query / 4 K-V heads (fp16)",
-              "key padding": "key padding, 50-100% kept (fp16)",
-              "varlen": "varlen, packed lengths in [S/4, S] (fp16)"}  # fmt: skip
-    fig, axes = plt.subplots(2, len(benches), figsize=(4.3 * len(benches), 7.8), sharex=True)
+    titles = {"bf16 dense": "bf16 dense", "bf16 causal": "bf16 causal",
+              "gqa 16/4": "GQA 16 / 4 heads", "key padding": "key-padding mask",
+              "varlen": "varlen"}  # fmt: skip
+    fig, axes = plt.subplots(2, len(benches), figsize=(5.0 * len(benches), 8.2), sharex=True)
     for c, bench in enumerate(benches):
         for r, pass_ in enumerate(("fwd", "fwd+bwd")):
             ax = axes[r, c]
@@ -203,13 +203,13 @@ def features_figure(rows, out):
                     line(ax, xs, ys, kernel)
             ax.set_xscale("log", base=2)
             ax.grid(True, alpha=0.3)
-            ax.set_title(f"{titles.get(bench, bench)}: {pass_}", fontsize=9)
+            ax.set_title(titles.get(bench, bench) if r == 0 else "", fontsize=14)
             if c == 0:
                 ax.set_ylabel(f"{pass_}: effective TFLOPS")
             if r == 1:
                 ax.set_xlabel("sequence length S")
-            ax.legend(fontsize=7)
-    fig.suptitle("B300: effective TFLOPS (visible FLOPs only), higher is better")
+            ax.legend(fontsize=10)
+    fig.suptitle("B300, D = 64, 16 heads (fp16 unless noted): effective TFLOPS, higher is better")
     fig.tight_layout()
     fig.savefig(out / "features_tflops.png", dpi=130)
     plt.close(fig)
@@ -222,7 +222,8 @@ def head_dims_figure(rows, out):
     for c, mode in enumerate(("dense", "causal")):
         for r, pass_ in enumerate(("fwd", "fwd+bwd")):
             ax = axes[r, c]
-            kernels = sorted({x["kernel"] for x in rows}, key=lambda k: k.startswith("KohakuFA"))
+            kernels = sorted({x["kernel"] for x in rows} - {"mem-efficient (SDPA)"},
+                             key=lambda k: k.startswith("KohakuFA"))  # fmt: skip
             for kernel in kernels:
                 pts = sorted((int(x["dim"]), float(x["tflops"])) for x in rows
                              if x["mode"] == mode and x["kernel"] == kernel
@@ -232,17 +233,46 @@ def head_dims_figure(rows, out):
                     line(ax, xs, ys, kernel)
             ax.set_xticks([64 * i for i in range(1, 9)])
             ax.grid(True, alpha=0.3)
-            ax.set_title(f"{mode}: {pass_}", fontsize=9)
+            ax.set_title(f"{mode}: {pass_}", fontsize=14)
             if c == 0:
                 ax.set_ylabel(f"{pass_}: effective TFLOPS")
             if r == 1:
                 ax.set_xlabel("head dim D")
-            ax.legend(fontsize=7)
-    fig.suptitle("B300, fp16, 16 heads, S = 4096: effective TFLOPS by head dim (higher is better;"
-                 " a missing point: the kernel does not run that head dim)", fontsize=10)  # fmt: skip
+            ax.legend(fontsize=10)
+    fig.suptitle("B300, fp16, S = 4096: effective TFLOPS by head dim")
     fig.tight_layout()
     fig.savefig(out / "head_dims_tflops.png", dpi=130)
     plt.close(fig)
+
+
+def tuner_figure(rows, out):
+    """Per shape: time of the planner's top pick, the tuned pick (shortlist timed) and
+    the best of a wide sweep, relative to the default configuration (lower is better)."""
+    labels = [f"{'fwd' if r['kind'] == 'forward' else 'bwd'} D={r['dim']}\nS={r['seq']}{' causal' if r['causal'] == '1' else ''}"
+              for r in rows]  # fmt: skip
+    xs = range(len(rows))
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    ax.axhline(1.0, color="gray", lw=1.5, ls="--", label="default configuration")
+    series = (("planner_top1_ms", "planner's top pick (no timing)", "#9467bd", "s"),
+              ("tuned_ms", "tuned (planner shortlist, timed)", "#d62728", "o"),
+              ("sweep_best_ms", "best of a wide sweep (50-110 timed)", "black", "x"))  # fmt: skip
+    for key, label, color, marker in series:
+        ys = [float(r[key]) / float(r["default_ms"]) for r in rows]
+        ax.plot(xs, ys, marker=marker, color=color, ls="none", ms=11 if marker == "o" else 9,
+                mew=2, label=label)  # fmt: skip
+    ax.set_xticks(list(xs), labels, fontsize=11)
+    ax.set_ylabel("time relative to the default")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(fontsize=11, loc="lower left")
+    fig.suptitle("B300, fp16, 32k tokens per call: block-size tuning (lower is better)")
+    fig.tight_layout()
+    fig.savefig(out / "tuner.png", dpi=130)
+    plt.close(fig)
+
+
+def _main_kernels(rows):
+    """Speed figures leave out the memory-efficient SDPA kernel (far behind everywhere)."""
+    return [r for r in rows if r["kernel"] != "mem-efficient (SDPA)"]
 
 
 def main():
@@ -259,9 +289,11 @@ def main():
         if rows_path.exists():
             violin_figure(torch.load(rows_path), out, tag)
     if (results / "speed.csv").exists():
-        speed_figures(read(results / "speed.csv"), out)
+        speed_figures(_main_kernels(read(results / "speed.csv")), out)
     if (results / "features.csv").exists():
-        features_figure(read(results / "features.csv"), out)
+        features_figure(_main_kernels(read(results / "features.csv")), out)
+    if (results / "tuner.csv").exists():
+        tuner_figure(read(results / "tuner.csv"), out)
     if (results / "head_dims.csv").exists():
         head_dims_figure(read(results / "head_dims.csv"), out)
 

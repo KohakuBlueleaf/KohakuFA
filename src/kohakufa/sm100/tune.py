@@ -25,7 +25,8 @@ from kohakufa.sm100 import plan as _plan
 from kohakufa.sm100.config import BackwardConfig, ForwardConfig, bucket
 
 _CACHE: dict[tuple, object] = {}
-_TUNED: set = set()  # keys tuned in this process (``save`` writes only these)
+_TUNED: set = set()
+EXHAUSTIVE = 24  # legal spaces up to this size are timed in full  # keys tuned in this process (``save`` writes only these)
 _KINDS = {"forward": ForwardConfig, "backward": BackwardConfig}
 TABLES = os.path.join(os.path.dirname(__file__), "tuned")
 
@@ -48,15 +49,24 @@ def lookup(arch: str, kind: str, head_dim: int, elem_bytes: int, causal: bool, l
     return None
 
 
-def shortlist(kind: str, shape: "_plan.Shape", dev: Device, per_family: int = 2, families: int = 4):
-    """The best ``per_family`` predicted configurations of the ``families`` best
-    predicted structural families."""
+def shortlist(kind: str, shape: "_plan.Shape", dev: Device, overall: int = 8, families: int = 8):
+    """The ``overall`` best predicted configurations, plus the best predicted one of each
+    of the ``families`` best structural families (so a family the model misjudges is
+    still timed); a small legal space is returned whole."""
     ranked = _plan.plan_topk(kind, shape, dev, topk=10**6)
-    groups: dict[tuple, list] = {}
+    if len(ranked) <= EXHAUSTIVE:  # a small space (the backward's): time all of it
+        return [estimate.config for estimate in ranked]
+    picked = [estimate.config for estimate in ranked[:overall]]
+    seen = set()
     for estimate in ranked:
-        groups.setdefault(_family(estimate.config), []).append(estimate.config)
-    picked = [cfgs[:per_family] for cfgs in list(groups.values())[:families]]
-    return [cfg for group in picked for cfg in group]
+        family = _family(estimate.config)
+        if family not in seen:
+            seen.add(family)
+            if estimate.config not in picked:
+                picked.append(estimate.config)
+            if len(seen) == families:
+                break
+    return picked
 
 
 def _family(cfg) -> tuple:
@@ -79,7 +89,7 @@ def tune(kind: str, head_dim: int, elem_bytes: int = 2, causal: bool = False,
         shapes = [(1, batch_heads, seq, seq, int(causal))]
     first = shapes[0]
     plan_shape = _plan.Shape(first[0] * first[1], first[2], first[3], head_dim, causal)
-    candidates = shortlist(kind, plan_shape, dev, families=6)
+    candidates = shortlist(kind, plan_shape, dev)
     from kohakufa.sm100.config import heuristic_backward, heuristic_forward
 
     default = (heuristic_forward if kind == "forward" else heuristic_backward)(head_dim, elem_bytes)

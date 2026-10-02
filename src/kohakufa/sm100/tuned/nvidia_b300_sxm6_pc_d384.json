@@ -68,11 +68,11 @@
    "block_n": 64,
    "s_slots": 2,
    "q_bufs": 1,
-   "kv_slots": 11,
-   "kv_group": 1,
+   "kv_slots": 6,
+   "kv_group": 2,
    "halves": 1,
    "vsplit": 1,
-   "out_bufs": 2
+   "out_bufs": 1
   }
  },
  {
@@ -90,11 +90,11 @@
    "block_n": 64,
    "s_slots": 2,
    "q_bufs": 1,
-   "kv_slots": 11,
-   "kv_group": 1,
+   "kv_slots": 6,
+   "kv_group": 2,
    "halves": 1,
    "vsplit": 1,
-   "out_bufs": 2
+   "out_bufs": 1
   }
  }
 ]

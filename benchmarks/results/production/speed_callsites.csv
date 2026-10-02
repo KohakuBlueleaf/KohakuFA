@@ -1,99 +1,93 @@
 site,shape,block,kernel,mode,pass,ms,graph
-encoder spatial (ViT-B),128x12x269x269,0,KohakuFA,dense,fwd,0.07699040174484253,True
-encoder spatial (ViT-B),128x12x269x269,0,KohakuFA,dense,fwd+bwd,0.3935920000076294,True
-encoder spatial (ViT-B),128x12x269x269,0,FA2 (SDPA flash),dense,fwd,0.1998576045036316,True
-encoder spatial (ViT-B),128x12x269x269,0,FA2 (SDPA flash),dense,fwd+bwd,0.9108976364135742,True
-encoder spatial (ViT-B),128x12x269x269,0,cuDNN (SDPA),dense,fwd,0.10649280548095703,True
-encoder spatial (ViT-B),128x12x269x269,0,cuDNN (SDPA),dense,fwd+bwd,0.45252161026000975,True
-encoder spatial (ViT-B),128x12x269x269,0,mem-efficient (SDPA),dense,fwd,0.2936928033828735,True
-encoder spatial (ViT-B),128x12x269x269,0,mem-efficient (SDPA),dense,fwd+bwd,1.3486927986145019,True
-encoder spatial (ViT-B),128x12x269x269,0,flex,dense,fwd,0.5697375774383545,True
-encoder spatial (ViT-B),128x12x269x269,0,flex,dense,fwd+bwd,1.4966320037841796,True
-encoder spatial (ViT-B),128x12x269x269,0,FA4,dense,fwd,0.08661760091781616,True
-encoder spatial (ViT-B),128x12x269x269,0,FA4,dense,fwd+bwd,0.4903728008270264,True
-encoder spatial (ViT-B),128x12x269x269,0,KohakuFA (pre-fix),dense,fwd,0.06984480023384095,True
-encoder spatial (ViT-B),128x12x269x269,0,KohakuFA (pre-fix),dense,fwd+bwd,0.36746079921722413,True
-encoder spatial (ViT-L),128x16x269x269,0,KohakuFA,dense,fwd,0.10039839744567872,True
-encoder spatial (ViT-L),128x16x269x269,0,KohakuFA,dense,fwd+bwd,0.514028787612915,True
-encoder spatial (ViT-L),128x16x269x269,0,FA2 (SDPA flash),dense,fwd,0.2655055999755859,True
-encoder spatial (ViT-L),128x16x269x269,0,FA2 (SDPA flash),dense,fwd+bwd,1.1973888397216796,True
-encoder spatial (ViT-L),128x16x269x269,0,cuDNN (SDPA),dense,fwd,0.13991039991378784,True
-encoder spatial (ViT-L),128x16x269x269,0,cuDNN (SDPA),dense,fwd+bwd,0.6008815765380859,True
-encoder spatial (ViT-L),128x16x269x269,0,mem-efficient (SDPA),dense,fwd,0.3917423963546753,True
-encoder spatial (ViT-L),128x16x269x269,0,mem-efficient (SDPA),dense,fwd+bwd,1.7860832214355469,True
-encoder spatial (ViT-L),128x16x269x269,0,flex,dense,fwd,0.7536752223968506,True
-encoder spatial (ViT-L),128x16x269x269,0,flex,dense,fwd+bwd,1.9784847259521485,True
-encoder spatial (ViT-L),128x16x269x269,0,FA4,dense,fwd,0.11373599767684936,True
-encoder spatial (ViT-L),128x16x269x269,0,FA4,dense,fwd+bwd,0.6457263946533203,True
-encoder spatial (ViT-L),128x16x269x269,0,KohakuFA (pre-fix),dense,fwd,0.09048960208892823,True
-encoder spatial (ViT-L),128x16x269x269,0,KohakuFA (pre-fix),dense,fwd+bwd,0.4775519847869873,True
-decoder joint,16x12x1799x1799,0,KohakuFA,dense,fwd,0.19266079664230346,True
-decoder joint,16x12x1799x1799,0,KohakuFA,dense,fwd+bwd,0.7752816200256347,True
-decoder joint,16x12x1799x1799,0,FA2 (SDPA flash),dense,fwd,0.5228816032409668,True
-decoder joint,16x12x1799x1799,0,FA2 (SDPA flash),dense,fwd+bwd,2.1121936798095704,True
-decoder joint,16x12x1799x1799,0,cuDNN (SDPA),dense,fwd,0.20920159816741943,True
-decoder joint,16x12x1799x1799,0,cuDNN (SDPA),dense,fwd+bwd,0.8417280197143555,True
-decoder joint,16x12x1799x1799,0,mem-efficient (SDPA),dense,fwd,1.1462639808654784,True
-decoder joint,16x12x1799x1799,0,mem-efficient (SDPA),dense,fwd+bwd,5.094372940063477,True
-decoder joint,16x12x1799x1799,0,flex,dense,fwd,1.260547161102295,True
-decoder joint,16x12x1799x1799,0,flex,dense,fwd+bwd,3.5855358123779295,True
-decoder joint,16x12x1799x1799,0,FA4,dense,fwd,0.1916048049926758,True
-decoder joint,16x12x1799x1799,0,FA4,dense,fwd+bwd,0.8414671897888184,True
-decoder joint,16x12x1799x1799,0,KohakuFA (pre-fix),dense,fwd,0.18017760515213013,True
-decoder joint,16x12x1799x1799,0,KohakuFA (pre-fix),dense,fwd+bwd,0.7147215843200684,True
-decoder block-causal,16x12x1799x1799,257,KohakuFA,block,fwd,0.15164480209350586,True
-decoder block-causal,16x12x1799x1799,257,KohakuFA,block,fwd+bwd,0.6150944232940674,True
-decoder block-causal,16x12x1799x1799,257,FA2 (SDPA flash),dense,fwd,0.5171679973602294,True
-decoder block-causal,16x12x1799x1799,257,FA2 (SDPA flash),dense,fwd+bwd,2.111939239501953,True
-decoder block-causal,16x12x1799x1799,257,cuDNN (SDPA),block,fwd,4.0967662811279295,True
-decoder block-causal,16x12x1799x1799,257,cuDNN (SDPA),block,fwd+bwd,5.466622543334961,True
-decoder block-causal,16x12x1799x1799,257,mem-efficient (SDPA),block,fwd,1.6919567108154296,True
-decoder block-causal,16x12x1799x1799,257,mem-efficient (SDPA),block,fwd+bwd,5.98694076538086,True
-decoder block-causal,16x12x1799x1799,257,flex,block,fwd,1.748739242553711,True
-decoder block-causal,16x12x1799x1799,257,flex,block,fwd+bwd,4.746948623657227,True
-decoder block-causal,16x12x1799x1799,257,FA4,block,fwd,0.023654399812221526,True
-decoder block-causal,16x12x1799x1799,257,FA4,block,fwd+bwd,0.19260319471359252,True
-decoder block-causal,16x12x1799x1799,257,KohakuFA (pre-fix),block,fwd,0.14056799411773682,True
-decoder block-causal,16x12x1799x1799,257,KohakuFA (pre-fix),block,fwd+bwd,0.5660079956054688,True
-decoder cross,112x12x257x256,0,KohakuFA,dense,fwd,0.047884801030159,True
-decoder cross,112x12x257x256,0,KohakuFA,dense,fwd+bwd,0.2719072103500366,True
-decoder cross,112x12x257x256,0,FA2 (SDPA flash),dense,fwd,0.12720799446105957,True
-decoder cross,112x12x257x256,0,FA2 (SDPA flash),dense,fwd+bwd,0.6025199890136719,True
-decoder cross,112x12x257x256,0,cuDNN (SDPA),dense,fwd,0.06451519727706909,True
-decoder cross,112x12x257x256,0,cuDNN (SDPA),dense,fwd+bwd,0.30526559352874755,True
-decoder cross,112x12x257x256,0,mem-efficient (SDPA),dense,fwd,0.2174527883529663,True
-decoder cross,112x12x257x256,0,mem-efficient (SDPA),dense,fwd+bwd,0.9862655639648438,True
-decoder cross,112x12x257x256,0,flex,dense,fwd,0.15299199819564818,True
-decoder cross,112x12x257x256,0,flex,dense,fwd+bwd,0.7052559852600098,True
-decoder cross,112x12x257x256,0,FA4,dense,fwd,0.06153759956359863,True
-decoder cross,112x12x257x256,0,FA4,dense,fwd+bwd,0.34521439075469973,True
-decoder cross,112x12x257x256,0,KohakuFA (pre-fix),dense,fwd,0.04621280133724213,True
-decoder cross,112x12x257x256,0,KohakuFA (pre-fix),dense,fwd+bwd,0.26237599849700927,True
-TT3D temporal (B),16x12x192x192,24,KohakuFA,block,fwd,0.01454080045223236,True
-TT3D temporal (B),16x12x192x192,24,KohakuFA,block,fwd+bwd,0.05862399935722351,True
-TT3D temporal (B),16x12x192x192,24,FA2 (SDPA flash),dense,fwd,0.01682559996843338,True
-TT3D temporal (B),16x12x192x192,24,FA2 (SDPA flash),dense,fwd+bwd,0.07228479981422424,True
-TT3D temporal (B),16x12x192x192,24,cuDNN (SDPA),block,fwd,0.026102399826049803,True
-TT3D temporal (B),16x12x192x192,24,cuDNN (SDPA),block,fwd+bwd,0.07609599828720093,True
-TT3D temporal (B),16x12x192x192,24,mem-efficient (SDPA),block,fwd,0.035051199793815616,True
-TT3D temporal (B),16x12x192x192,24,mem-efficient (SDPA),block,fwd+bwd,0.10914399623870849,True
-TT3D temporal (B),16x12x192x192,24,flex,block,fwd,0.21995999813079833,True
-TT3D temporal (B),16x12x192x192,24,flex,block,fwd+bwd,0.3639039993286133,True
-TT3D temporal (B),16x12x192x192,24,FA4,block,fwd,0.015825599431991577,True
-TT3D temporal (B),16x12x192x192,24,FA4,block,fwd+bwd,0.04006080031394958,True
-TT3D temporal (B),16x12x192x192,24,KohakuFA (pre-fix),block,fwd,0.013792000710964203,True
-TT3D temporal (B),16x12x192x192,24,KohakuFA (pre-fix),block,fwd+bwd,0.055353599786758426,True
-TT3D temporal (L),16x16x192x192,24,KohakuFA,block,fwd,0.015559999644756317,True
-TT3D temporal (L),16x16x192x192,24,KohakuFA,block,fwd+bwd,0.07392160296440124,True
-TT3D temporal (L),16x16x192x192,24,FA2 (SDPA flash),dense,fwd,0.019307200610637665,True
-TT3D temporal (L),16x16x192x192,24,FA2 (SDPA flash),dense,fwd+bwd,0.09207199811935425,True
-TT3D temporal (L),16x16x192x192,24,cuDNN (SDPA),block,fwd,0.026313599944114686,True
-TT3D temporal (L),16x16x192x192,24,cuDNN (SDPA),block,fwd+bwd,0.09179199934005737,True
-TT3D temporal (L),16x16x192x192,24,mem-efficient (SDPA),block,fwd,0.04676640033721924,True
-TT3D temporal (L),16x16x192x192,24,mem-efficient (SDPA),block,fwd+bwd,0.13477120399475098,True
-TT3D temporal (L),16x16x192x192,24,flex,block,fwd,0.22921600341796874,True
-TT3D temporal (L),16x16x192x192,24,flex,block,fwd+bwd,0.43926081657409666,True
-TT3D temporal (L),16x16x192x192,24,FA4,block,fwd,0.015700800716876982,True
-TT3D temporal (L),16x16x192x192,24,FA4,block,fwd+bwd,0.04732480049133301,True
-TT3D temporal (L),16x16x192x192,24,KohakuFA (pre-fix),block,fwd,0.014764800667762756,True
-TT3D temporal (L),16x16x192x192,24,KohakuFA (pre-fix),block,fwd+bwd,0.06902559995651245,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,KohakuFA,dense,fwd,0.07249600291252137,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,KohakuFA,dense,fwd+bwd,0.3899327993392944,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,FA2 (SDPA flash),dense,fwd,0.19994399547576905,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,FA2 (SDPA flash),dense,fwd+bwd,0.9106016159057617,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,cuDNN (SDPA),dense,fwd,0.10636639595031738,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,cuDNN (SDPA),dense,fwd+bwd,0.45189599990844725,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,mem-efficient (SDPA),dense,fwd,0.29377601146697996,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,mem-efficient (SDPA),dense,fwd+bwd,1.3480848312377929,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,flex,dense,fwd,0.569649600982666,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,flex,dense,fwd+bwd,1.4976048469543457,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,FA4,dense,fwd,0.08661919832229614,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,FA4,dense,fwd+bwd,0.4901519775390625,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,KohakuFA (pre-fix),dense,fwd,0.07007039785385132,True
+"dense, S=269, B=128, H=12",128x12x269x269,0,KohakuFA (pre-fix),dense,fwd+bwd,0.36825439929962156,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,KohakuFA,dense,fwd,0.09419360160827636,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,KohakuFA,dense,fwd+bwd,0.510587215423584,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,FA2 (SDPA flash),dense,fwd,0.26666719913482667,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,FA2 (SDPA flash),dense,fwd+bwd,1.1969327926635742,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,cuDNN (SDPA),dense,fwd,0.13971840143203734,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,cuDNN (SDPA),dense,fwd+bwd,0.6011023998260498,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,mem-efficient (SDPA),dense,fwd,0.3914736032485962,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,mem-efficient (SDPA),dense,fwd+bwd,1.785593605041504,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,flex,dense,fwd,0.7516416072845459,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,flex,dense,fwd+bwd,1.978233528137207,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,FA4,dense,fwd,0.11402560472488403,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,FA4,dense,fwd+bwd,0.6468255996704102,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,KohakuFA (pre-fix),dense,fwd,0.09073119759559631,True
+"dense, S=269, B=128, H=16",128x16x269x269,0,KohakuFA (pre-fix),dense,fwd+bwd,0.4777184009552002,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,KohakuFA,dense,fwd,0.20979681015014648,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,KohakuFA,dense,fwd+bwd,0.7927743911743164,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,FA2 (SDPA flash),dense,fwd,0.5220191955566407,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,FA2 (SDPA flash),dense,fwd+bwd,2.1125648498535154,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,cuDNN (SDPA),dense,fwd,0.20918560028076172,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,cuDNN (SDPA),dense,fwd+bwd,0.8423744201660156,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,mem-efficient (SDPA),dense,fwd,1.1470527648925781,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,mem-efficient (SDPA),dense,fwd+bwd,5.096291351318359,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,flex,dense,fwd,1.2571120262145996,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,flex,dense,fwd+bwd,3.5802047729492186,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,FA4,dense,fwd,0.19135199785232543,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,FA4,dense,fwd+bwd,0.8443840026855469,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,KohakuFA (pre-fix),dense,fwd,0.1829568028450012,True
+"dense, S=1799, B=16, H=12",16x12x1799x1799,0,KohakuFA (pre-fix),dense,fwd+bwd,0.7170415878295898,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,KohakuFA,block,fwd,0.16928479671478272,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,KohakuFA,block,fwd+bwd,0.6281199932098389,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,FA2 (SDPA flash),dense,fwd,0.5177567958831787,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,FA2 (SDPA flash),dense,fwd+bwd,2.112721633911133,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,cuDNN (SDPA),block,fwd,4.092155075073242,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,cuDNN (SDPA),block,fwd+bwd,5.459076690673828,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,mem-efficient (SDPA),block,fwd,1.6915599822998046,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,mem-efficient (SDPA),block,fwd+bwd,5.985795211791992,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,flex,block,fwd,1.734886360168457,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,flex,block,fwd+bwd,4.731753540039063,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,KohakuFA (pre-fix),block,fwd,0.14040640592575074,True
+"block-causal (frame 257), S=1799, B=16, H=12",16x12x1799x1799,257,KohakuFA (pre-fix),block,fwd+bwd,0.5656176090240479,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,KohakuFA,dense,fwd,0.054872000217437746,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,KohakuFA,dense,fwd+bwd,0.28148000240325927,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,FA2 (SDPA flash),dense,fwd,0.12762240171432496,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,FA2 (SDPA flash),dense,fwd+bwd,0.6020112037658691,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,cuDNN (SDPA),dense,fwd,0.0643504023551941,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,cuDNN (SDPA),dense,fwd+bwd,0.30422239303588866,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,mem-efficient (SDPA),dense,fwd,0.21751201152801514,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,mem-efficient (SDPA),dense,fwd+bwd,0.9848383903503418,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,flex,dense,fwd,0.15298880338668824,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,flex,dense,fwd+bwd,0.7049600124359131,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,FA4,dense,fwd,0.06109279990196228,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,FA4,dense,fwd+bwd,0.3450752019882202,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,KohakuFA (pre-fix),dense,fwd,0.046408000588417056,True
+"cross, Sq=257 Skv=256, B=112, H=12",112x12x257x256,0,KohakuFA (pre-fix),dense,fwd+bwd,0.262228798866272,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,KohakuFA,block,fwd,0.014022399485111237,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,KohakuFA,block,fwd+bwd,0.06114240288734436,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,FA2 (SDPA flash),dense,fwd,0.016808000206947327,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,FA2 (SDPA flash),dense,fwd+bwd,0.07243199944496155,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,cuDNN (SDPA),block,fwd,0.026295998692512514,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,cuDNN (SDPA),block,fwd+bwd,0.07585600018501282,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,mem-efficient (SDPA),block,fwd,0.03526079952716828,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,mem-efficient (SDPA),block,fwd+bwd,0.10873119831085205,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,flex,block,fwd,0.2178191900253296,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,flex,block,fwd+bwd,0.3845776081085205,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,KohakuFA (pre-fix),block,fwd,0.013687999546527862,True
+"block-causal (frame 24), S=192, B=16, H=12",16x12x192x192,24,KohakuFA (pre-fix),block,fwd+bwd,0.05502399802207947,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,KohakuFA,block,fwd,0.016076800227165223,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,KohakuFA,block,fwd+bwd,0.07802079916000366,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,FA2 (SDPA flash),dense,fwd,0.019275200366973878,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,FA2 (SDPA flash),dense,fwd+bwd,0.09163200259208679,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,cuDNN (SDPA),block,fwd,0.02643199861049652,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,cuDNN (SDPA),block,fwd+bwd,0.0908415973186493,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,mem-efficient (SDPA),block,fwd,0.04681439995765686,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,mem-efficient (SDPA),block,fwd+bwd,0.13429280519485473,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,flex,block,fwd,0.2200000047683716,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,flex,block,fwd+bwd,0.43327841758728025,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,KohakuFA (pre-fix),block,fwd,0.014958399534225463,True
+"block-causal (frame 24), S=192, B=16, H=16",16x16x192x192,24,KohakuFA (pre-fix),block,fwd+bwd,0.06991360187530518,True

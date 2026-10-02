@@ -7,8 +7,9 @@ planner's shortlist timed interleaved; writes ``<card>_d<D>.json`` (one file per
 dim, so dims can be tuned in parallel). Prints every candidate's time.
 
 ``--short``: the short-sequence buckets instead (<= 512 and <= 2048 tokens), tuned on the
-call-site shapes of a real model (Foliation: ViT encoder, diffusion decoder, temporal
-mixers), dense and masked summed separately; writes ``<card>_d<D>_short.json``.
+attention shapes of a video model (spatial ViT attention, a diffusion decoder's joint,
+block-causal and cross attention, short temporal attention), dense and masked summed
+separately; writes ``<card>_d<D>_short.json``.
 """
 
 import argparse
@@ -20,22 +21,22 @@ import torch
 from kohakufa.device import Device
 from kohakufa.sm100 import tune
 
-# (batch, heads, seq_q, seq_kv, block): Foliation's attention call sites, per bucket
+# (batch, heads, seq_q, seq_kv, block): a video model's attention shapes, per bucket
 SHORT_SHAPES = {
     "s512": {
         "dense": [
-            (128, 12, 269, 269, 0),  # ViT-B encoder, spatial
-            (128, 16, 269, 269, 0),  # ViT-L encoder, spatial
-            (112, 12, 257, 256, 0),  # decoder, cross
+            (128, 12, 269, 269, 0),
+            (128, 16, 269, 269, 0),
+            (112, 12, 257, 256, 0),  # cross attention
         ],
         "masked": [
-            (16, 12, 192, 192, 24),  # TT3D temporal mixer (B)
-            (16, 16, 192, 192, 24),  # TT3D temporal mixer (L)
+            (16, 12, 192, 192, 24),
+            (16, 16, 192, 192, 24),
         ],
     },
     "s2048": {
-        "dense": [(16, 12, 1799, 1799, 0)],  # decoder, joint
-        "masked": [(16, 12, 1799, 1799, 257)],  # decoder, block-causal frames
+        "dense": [(16, 12, 1799, 1799, 0)],  # dense
+        "masked": [(16, 12, 1799, 1799, 257)],  # block-causal frames
     },
 }
 

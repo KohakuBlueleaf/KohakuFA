@@ -68,8 +68,8 @@
    "block_n": 128,
    "s_slots": 2,
    "q_bufs": 1,
-   "kv_slots": 9,
-   "kv_group": 1,
+   "kv_slots": 3,
+   "kv_group": 3,
    "halves": 1,
    "vsplit": 1,
    "out_bufs": 1

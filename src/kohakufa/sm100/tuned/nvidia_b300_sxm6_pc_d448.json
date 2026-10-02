@@ -63,16 +63,16 @@
    "long"
   ],
   "config": {
-   "dc": 32,
-   "nch": 14,
-   "block_n": 128,
-   "s_slots": 2,
+   "dc": 64,
+   "nch": 7,
+   "block_n": 64,
+   "s_slots": 1,
    "q_bufs": 1,
    "kv_slots": 11,
    "kv_group": 1,
    "halves": 1,
-   "vsplit": 2,
-   "out_bufs": 2
+   "vsplit": 1,
+   "out_bufs": 1
   }
  },
  {

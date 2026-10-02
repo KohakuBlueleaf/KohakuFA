@@ -40,8 +40,8 @@
    "nch": 5,
    "alias": true,
    "kv_bufs": 1,
-   "q_slots": 2,
-   "do_slots": 5,
+   "q_slots": 3,
+   "do_slots": 8,
    "p_regs": 144,
    "ds_regs": 144,
    "small_regs": 32,
@@ -50,7 +50,7 @@
    "stream": true,
    "nsl": 3,
    "nw": 2,
-   "k_res": true
+   "k_res": false
   }
  },
  {
@@ -68,8 +68,8 @@
    "block_n": 64,
    "s_slots": 3,
    "q_bufs": 1,
-   "kv_slots": 15,
-   "kv_group": 1,
+   "kv_slots": 3,
+   "kv_group": 5,
    "halves": 1,
    "vsplit": 1,
    "out_bufs": 1
@@ -88,13 +88,13 @@
    "dc": 64,
    "nch": 5,
    "block_n": 64,
-   "s_slots": 3,
+   "s_slots": 2,
    "q_bufs": 1,
-   "kv_slots": 15,
+   "kv_slots": 13,
    "kv_group": 1,
    "halves": 1,
    "vsplit": 1,
-   "out_bufs": 1
+   "out_bufs": 2
   }
  }
 ]

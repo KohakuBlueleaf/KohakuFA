@@ -16,17 +16,17 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+matplotlib.rcParams["font.size"] = 13
 import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 
 from plot import STYLE  # noqa: E402
 
-STYLE = {**STYLE, "KohakuFA (pre-fix)": ("#e377c2", "P")}
-
 
 def read(path):
+    """Rows of a summary CSV (the pre-fix kernel's rows are left out of every figure)."""
     with open(path) as file:
-        return list(csv.DictReader(file))
+        return [r for r in csv.DictReader(file) if "pre-fix" not in " ".join(map(str, r.values()))]
 
 
 def smooth(xs, ys, window):
@@ -74,9 +74,9 @@ def training_figure(results, out):
             textcoords="offset points",
             xytext=(0, 8),
             ha="center",
-            fontsize=7,
+            fontsize=10,
         )
-    ax.legend(fontsize=8, loc="center left")
+    ax.legend(fontsize=12, loc="center left")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out / "production_training.png", dpi=130)
@@ -117,9 +117,9 @@ def precision_figure(results, out):
                 ax.set_xticks(
                     sorted(logit_at),
                     [f"{s // 1000}k\n{logit_at[s]:.0e}" for s in sorted(logit_at)],
-                    fontsize=8,
+                    fontsize=12,
                 )
-    axes[0, 0].legend(fontsize=8)
+    axes[0, 0].legend(fontsize=12)
     fig.suptitle(
         "The production layer's attention backward (real activations, fp16, loss-scaled dO) "
         "against fp64 on the same inputs"
@@ -172,11 +172,11 @@ def model_figure(results, out):
                     )
             if metric == "rel_err":
                 ax.set_yscale("log")
-            ax.set_title(f"{names[group]}: {label}", fontsize=9)
+            ax.set_title(f"{names[group]}: {label}", fontsize=14)
             ax.grid(True, alpha=0.3)
             if r == 1:
                 ax.set_xlabel("checkpoint step")
-    axes[0, 0].legend(fontsize=8)
+    axes[0, 0].legend(fontsize=12)
     fig.suptitle(
         "Whole-model gradient of one training step (fp16 autocast) against fp64, same weights and batch"
     )
@@ -200,10 +200,11 @@ def speed_figure(results, out):
     path = results / "speed_callsites.csv"
     if not path.exists():
         return
+    keep = [r for r in read(path) if r["kernel"] != "mem-efficient (SDPA)"]  # far behind
     # FA4 block-causal (mask_mod) has a wrong backward; FA2 has no block-causal mode
     rows = [
         r
-        for r in read(path)
+        for r in keep
         if r["graph"] == "True"
         and r["mode"] != "dense"
         or (r["graph"] == "True" and r["block"] == "0")
@@ -213,7 +214,7 @@ def speed_figure(results, out):
     ]
     sites = list(dict.fromkeys(r["site"] for r in rows))
     passes = ("fwd", "fwd+bwd")
-    fig, axes = plt.subplots(len(passes), len(sites), figsize=(3.1 * len(sites), 7.2))
+    fig, axes = plt.subplots(len(passes), len(sites), figsize=(4.1 * len(sites), 8.2))
     for r, pass_ in enumerate(passes):
         for c, site in enumerate(sites):
             ax = axes[r, c]
@@ -237,14 +238,17 @@ def speed_figure(results, out):
                 linewidth=1.5,
             )
             for i, (v, n) in enumerate(entries):
-                ax.text(v, i, f" {v:.0f}", va="center", fontsize=7.5)
-            ax.set_yticks(range(len(entries)), names, fontsize=7.5)
+                ax.text(v, i, f" {v:.0f}", va="center", fontsize=11)
+            ax.set_yticks(range(len(entries)), names, fontsize=11)
             ax.set_xlim(0, max(values) * 1.3)
             ax.grid(True, axis="x", alpha=0.3)
-            ax.set_title(f"{site}\n{pass_}", fontsize=9)
+            setup, shape = site.split(", ", 1)
+            ax.set_title(f"{setup}: {pass_}\n{shape}", fontsize=13)
             if r == len(passes) - 1:
-                ax.set_xlabel("effective TFLOPS", fontsize=8)
-    fig.suptitle("B300, fp16, production attention call sites: effective TFLOPS (higher is better)")
+                ax.set_xlabel("effective TFLOPS", fontsize=12)
+    fig.suptitle(
+        "B300, fp16, D = 64: effective TFLOPS at a video model's attention shapes (higher is better)"
+    )
     fig.tight_layout()
     fig.savefig(out / "production_speed.png", dpi=130)
     plt.close(fig)

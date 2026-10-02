@@ -40,7 +40,7 @@
    "nch": 4,
    "alias": true,
    "kv_bufs": 1,
-   "q_slots": 2,
+   "q_slots": 3,
    "do_slots": 8,
    "p_regs": 144,
    "ds_regs": 144,
@@ -68,11 +68,11 @@
    "block_n": 128,
    "s_slots": 2,
    "q_bufs": 1,
-   "kv_slots": 7,
+   "kv_slots": 8,
    "kv_group": 1,
    "halves": 1,
    "vsplit": 1,
-   "out_bufs": 2
+   "out_bufs": 1
   }
  },
  {

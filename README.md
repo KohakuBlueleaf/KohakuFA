@@ -83,8 +83,8 @@ B300, fp16, head dim 64, 16 heads, 32k tokens per call, timed inside CUDA graphs
 * **Dense:** fastest fwd+bwd up to 2k tokens (2.7x FA2 at 2k, vs 2.5x cuDNN and 2.4x FA4) and the
   fastest forward below 1k; at 8k to 16k on par with FA4 / cuDNN for fwd+bwd (2.57x vs 2.56x /
   2.65x at 16k) and ~10% behind them on the forward alone.
-* **Token causal:** currently 5 to 15% behind cuDNN and FA4 (diagonal tiles still take the
-  generic masked path; tuning is on the roadmap).
+* **Token causal:** behind cuDNN and FA4: forward 8-9% up to 2k tokens, 14% at 4k and ~25% at
+  8k to 16k; fwd+bwd 4 to 12%. See [known gaps](#known-gaps).
 * **Block causal:** 1.8x to 4.7x FA2-dense; cuDNN with an explicit mask is at or below FA2,
   flex attention up to 1.8x. FA4's `mask_mod` + block-sparsity path is not shown: its forward is
   correct but its backward is wrong (dQ / dK / dV relative error 1.4 to 3.0).
@@ -122,6 +122,8 @@ the work fits one SM:
 * **backward**: above D = 128 a CTA owns one key tile and a <= 128-column slice of dK /
   dV / dQ (S^T and dP^T recomputed per slice), K resident and V / Q / dO streamed.
 
+![effective TFLOPS by head dim](docs/images/head_dims_tflops.png)
+
 B300, fp16, 16k tokens, dense, effective TFLOPS (forward / backward):
 
 | D | 64 | 128 | 192 | 256 | 320 | 384 | 448 | 512 |
@@ -147,6 +149,62 @@ bucket). The tables tuned on B300 ship in `sm100/tuned/`; other shapes and cards
 planner's best prediction. `python benchmarks/tune.py` re-tunes;
 `kohakufa/device.py` describes a card and maps an architecture to its kernels (sm_120
 plugs in there).
+
+How well that works, on B300 at 32k tokens per call: every candidate below was timed in
+one process, interleaved, from CUDA graphs. The wide sweep times the best 3 configurations of
+every structural family (50 to 110 per shape) as a stand-in for the full space, and the
+backward's whole space (12 to 20 configurations).
+
+![block-size tuning](docs/images/tuner.png)
+
+| shape | legal configs | timed by the tuner | default | tuned | wide sweep best | gain |
+|---|---|---|---|---|---|---|
+| fwd D=64, S=1k / 4k / 16k, 4k causal | 960 | 15 | - | = default | = default | 1.00x |
+| fwd D=128, S=4096 | 1011 | 16 | 0.844 ms | 0.816 ms | 0.816 ms | 1.03x |
+| fwd D=128, S=4096 causal | 1011 | 16 | 0.507 ms | 0.507 ms | 0.507 ms | 1.00x |
+| fwd D=256, S=4096 | 589 | 16 | 1.680 ms | 1.435 ms | 1.435 ms | 1.17x |
+| fwd D=512, S=4096 | 192 | 14 | 10.07 ms | 5.12 ms | 5.12 ms | 1.97x |
+| bwd D=64 / D=256, S=4096 | 20 / 12 | all | 1.388 / 7.888 ms | 1.388 / 7.838 ms | (whole space) | 1.00x |
+
+* The tuned pick matches the best of the wide sweep for every shape, timing 14 to 16 of up to
+  ~1000 legal forward configurations. The planner's untimed top pick is the fastest in 6 of
+  the 8 forward shapes; the misses (D = 128 causal, D = 512) are why a shortlist is timed.
+* Gains come at wide heads, where a hand-written default cannot know the trade-offs; at
+  D = 64 the hand-tuned default is already the best of 72 timed configurations.
+* The shortlist is the 8 best predictions plus the best of each of the 8 best families, plus
+  the default; spaces of up to 24 configurations are timed whole.
+
+## Known gaps
+
+Where KohakuFA is measurably slower than the fastest of FlashAttention-4 and cuDNN on B300
+(time ratio, > 1 = slower), and why:
+
+| case | forward | fwd+bwd | cause |
+|---|---|---|---|
+| token causal, D = 64, up to 2k tokens | 1.08-1.09 | 1.04-1.12 | wasted tile + masked diagonal (below) |
+| token causal, D = 64, 8k to 16k tokens | 1.24-1.25 | 1.06-1.07 | the same, plus the long dense forward gap |
+| dense, D = 64, 8k to 16k tokens | 1.09-1.15 | 1.01-1.03 | exact O rescale every key tile |
+| D = 128, dense, 16k tokens | ~1.25 | ~1.2 | forward: exact rescale on the critical path; backward: dQ reduce |
+| D = 256, dense, 16k tokens | 0.99 | ~1.2 (backward 1.24) | backward recomputes S / dP per output slice (FA4 uses 2-CTA MMAs) |
+
+* **Token causal.** A forward CTA covers 256 query rows as two 128-row halves, and both halves
+  walk the key tiles of the second half: the first half also computes the second half's
+  diagonal key tile, which it cannot see (fully masked work, one wasted tile per 256 rows:
+  ~20% of the work at 1k tokens, ~1.5% at 16k). Diagonal tiles also take the generic masked
+  softmax path. Planned: a per-half key-tile count, and a token-causal diagonal fast path.
+  The backward does not have the wasted tile (each key tile starts at its diagonal).
+* **Exact rescaling.** The forward rescales O by exp2(m_old - m_new) after every key tile.
+  FlashAttention-4 skips most rescales by letting the row max lag behind the true max, which
+  is what makes its largest P differ from 1 and its gradients drift at large logits
+  ([precision bug 2](docs/precision.md)). KohakuFA keeps the exact form; with two query halves
+  per CTA it sits on the critical path, with one half the softmax warpgroup is the bound.
+* **dQ accumulation.** The backward adds dQ partials with TMA tensor reduce-adds; FA4 uses a 1D
+  bulk reduce that Gluon does not expose. Removing the reduce entirely would bring D = 128 to
+  FA4's time.
+* **Wide heads.** Above D = 128 the backward recomputes S and dP for each 128-column output
+  slice (7 instead of 5 matrix products at D = 256, 11 at D = 512).
+
+Details and the measurements behind each: [docs/performance-notes.md](docs/performance-notes.md).
 
 ## Production case: how the bugs were found
 
@@ -205,19 +263,20 @@ attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=No
 * `block_causal=P`: query `r` sees the keys of frames `0..r // P`.
 * `compute_dtype`: tensor-core operand dtype; other input dtypes (e.g. fp32) are cast.
 
-## Status
+## Features
 
 | | |
 |---|---|
 | dense, token causal, block causal, cross attention (`Sq != Skv`) | yes |
 | fp16 and bf16 compute; fp32 inputs (cast) | yes |
 | GQA / MQA (`k` / `v` with fewer heads) | yes |
-| head dim 1 .. 512 (native at multiples of 16, others zero-padded) | yes (see the head-dim notes below) |
+| head dim 1 .. 512 (native at multiples of 16, others zero-padded) | yes ([head dims](#head-dims-64-to-512)) |
 | `torch.compile`, CUDA graphs | yes |
 | boolean mask (broadcastable `[B, H, Sq, Skv]`, empty rows -> 0) | yes (hidden tiles skipped) |
 | variable length (packed sequences, `cu_seqlens`; no padding computed) | yes |
-| analytical block-size autotuner | planned |
-| sm_120 | planned |
+| block sizes: analytical planner + timed shortlist, tuned tables for B300 | yes ([block sizes](#block-sizes-planned-then-timed)) |
+| token-causal fast path (per-half key count, diagonal tiles) | planned ([known gaps](#known-gaps)) |
+| sm_120 | planned (`device.py` architecture slot) |
 
 ## Reproducing
 

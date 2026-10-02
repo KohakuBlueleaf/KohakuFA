@@ -49,6 +49,11 @@ REDUCE_PER_16KB = 250.0
 NARROW_CHUNK = 0.15
 SHALLOW_RING = 0.08
 SINGLE_BUFFER = 0.03
+# two query halves per CTA: serial chain length per S-ring depth (measured: 1 slot ~1.9x
+# and 2 slots ~1.2x the 3-slot time at D = 64)
+CHAIN_OVERLAP = {1: 1.6, 2: 1.04, 3: 0.84}
+RING_CHUNKS = 6  # K / V chunks in flight that hide the TMA latency
+L2_SHARE = 0.7  # the forward's K / V reads hit L2 lines other CTAs of the head fetched
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,16 +100,21 @@ def score_forward(cfg: ForwardConfig, shape: Shape, dev: Device) -> Estimate:
     softmax_wg = SOFTMAX_FIXED + SOFTMAX_PER_COLUMN * bn
     ex2 = halves * HALF * bn / dev.ex2
     per_tile, limiter = max((mma, "mma"), (softmax_wg, "softmax"), (ex2, "mufu"))
-    if cfg.s_slots < 2 * halves:  # each half's next S waits for its P V
-        chain = softmax_wg + RESCALE_PER_CHUNK * cfg.nv + mma
+    if halves == 2:  # each half's next S waits for its P V: the deeper the S ring, the
+        # more of the chain overlaps the other half's work (fitted at D = 64 and 128)
+        chain = (softmax_wg + RESCALE_PER_CHUNK * cfg.nv + mma) * CHAIN_OVERLAP[cfg.s_slots]
+        if chain > per_tile:
+            per_tile, limiter = chain, "chain"
+    elif cfg.s_slots == 1:  # one half, one S slot: the next QK^T waits for this softmax
+        chain = softmax_wg + mma
         if chain > per_tile:
             per_tile, limiter = chain, "chain"
     kv_bytes = (bn * d + bn * nv_cols) * 2
-    l2 = kv_bytes / (dev.l2_bw * 1e9 / dev.sms / (dev.clock_ghz * 1e9))
+    l2 = L2_SHARE * kv_bytes / (dev.l2_bw * 1e9 / dev.sms / (dev.clock_ghz * 1e9))
     if l2 > per_tile:
         per_tile, limiter = l2, "l2"
-    ring_tiles = cfg.kv_slots * cfg.kv_group / cfg.nch
-    per_tile *= _second_order(cfg.dc, ring_tiles / 3, cfg.q_bufs, cfg.out_bufs)
+    ring_chunks = cfg.kv_slots * cfg.kv_group  # [block_n, dc] chunks in flight
+    per_tile *= _second_order(cfg.dc, ring_chunks / RING_CHUNKS, cfg.q_bufs, cfg.out_bufs)
     tiles = shape.batch_heads * math.ceil(shape.seq_q / rows) * cfg.vsplit
     key_tiles = math.ceil(shape.seq_kv / bn) * shape.visible()
     waves = math.ceil(tiles / dev.sms)

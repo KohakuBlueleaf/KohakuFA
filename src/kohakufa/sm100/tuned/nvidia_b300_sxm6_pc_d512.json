@@ -63,16 +63,16 @@
    "long"
   ],
   "config": {
-   "dc": 32,
-   "nch": 16,
+   "dc": 64,
+   "nch": 8,
    "block_n": 128,
    "s_slots": 2,
    "q_bufs": 1,
    "kv_slots": 4,
-   "kv_group": 2,
+   "kv_group": 1,
    "halves": 1,
    "vsplit": 2,
-   "out_bufs": 2
+   "out_bufs": 1
   }
  },
  {
@@ -85,16 +85,16 @@
    "long"
   ],
   "config": {
-   "dc": 64,
-   "nch": 8,
-   "block_n": 64,
+   "dc": 32,
+   "nch": 16,
+   "block_n": 128,
    "s_slots": 2,
    "q_bufs": 1,
-   "kv_slots": 7,
-   "kv_group": 1,
+   "kv_slots": 5,
+   "kv_group": 2,
    "halves": 1,
    "vsplit": 2,
-   "out_bufs": 2
+   "out_bufs": 1
   }
  }
 ]
