@@ -3,6 +3,8 @@ query row (forward), and 32 queries per word along each key row (backward), padd
 whole 128-wide tiles so a tile's words never run past a row."""
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor
 
 TILE = 128
@@ -26,58 +28,68 @@ def normalize(mask: Tensor, batch: int, heads: int, s_q: int, s_kv: int) -> Tens
     return mask
 
 
-def pack_rows(mask: Tensor) -> Tensor:
-    """``[..., R, C]`` bool -> ``[..., R, W]`` int32, bit ``c % 32`` of word ``c // 32``
-    = ``mask[..., r, c]``; ``W`` covers ``C`` rounded up to a multiple of TILE."""
-    cols = mask.shape[-1]
-    padded = -(-cols // TILE) * TILE
-    bits = torch.zeros(*mask.shape[:-1], padded, dtype=torch.int64, device=mask.device)
-    bits[..., :cols] = mask
-    bits = bits.unflatten(-1, (padded // 32, 32)) << torch.arange(32, device=mask.device)
-    words = bits.sum(-1)  # 0 .. 2^32 - 1
-    return torch.where(words >= 2**31, words - 2**32, words).to(torch.int32).contiguous()
+@triton.jit
+def _pack_kernel(
+    mask_ptr, words_ptr, words_t_ptr, any_ptr, all_ptr, s_q, s_kv, heads_m,
+    stride_b, stride_h, stride_r, stride_c, q_blocks, k_blocks,
+    BLOCK: tl.constexpr,
+):  # fmt: skip
+    """One (mask slice, 128-query block, 128-key block): the rows' words (bit c % 32 of
+    word c // 32 = key c), the transposed words (per key, over queries), and whether
+    any / every key of the block is visible (rows past S_q count as seeing all; keys past
+    S_kv as hidden)."""
+    slice_ = tl.program_id(0)
+    qb = tl.program_id(1)
+    kb = tl.program_id(2)
+    b = slice_ // heads_m
+    h = slice_ % heads_m
+    rows = qb * BLOCK + tl.arange(0, BLOCK)
+    cols = kb * BLOCK + tl.arange(0, BLOCK)
+    row_ok = rows < s_q
+    col_ok = cols < s_kv
+    ptrs = (
+        mask_ptr + b * stride_b + h * stride_h + rows[:, None] * stride_r + cols[None, :] * stride_c
+    )
+    bits = tl.load(ptrs, mask=row_ok[:, None] & col_ok[None, :], other=0).to(tl.int32)
+    shifts = tl.arange(0, 32)
+    # rows' words: [BLOCK, BLOCK / 32] (distinct bits: their sum is their OR)
+    words = tl.sum(tl.reshape(bits, (BLOCK, BLOCK // 32, 32)) << shifts[None, None, :], axis=2)
+    word_cols = kb * (BLOCK // 32) + tl.arange(0, BLOCK // 32)
+    out = words_ptr + (slice_ * s_q + rows[:, None]).to(tl.int64) * (k_blocks * (BLOCK // 32))
+    tl.store(out + word_cols[None, :], words, mask=row_ok[:, None])
+    # keys' words over queries: the transpose
+    bits_t = tl.trans(bits)
+    words_t = tl.sum(tl.reshape(bits_t, (BLOCK, BLOCK // 32, 32)) << shifts[None, None, :], axis=2)
+    word_rows = qb * (BLOCK // 32) + tl.arange(0, BLOCK // 32)
+    out_t = words_t_ptr + (slice_ * s_kv + cols[:, None]).to(tl.int64) * (q_blocks * (BLOCK // 32))
+    tl.store(out_t + word_rows[None, :], words_t, mask=col_ok[:, None])
+    # block classes
+    full = tl.where(row_ok[:, None], bits, 1)
+    full = tl.where(col_ok[None, :], full, 0)
+    cell = (slice_ * q_blocks + qb) * k_blocks + kb
+    tl.store(any_ptr + cell, tl.max(tl.max(bits, axis=1), axis=0).to(tl.int8))
+    tl.store(all_ptr + cell, tl.min(tl.min(full, axis=1), axis=0).to(tl.int8))
 
 
-def pack(mask: Tensor, batch: int, heads: int, s_q: int, s_kv: int) -> tuple[Tensor, Tensor]:
-    """(forward words over keys ``[Bm, Hm, Sq, W]``, backward words over queries
-    ``[Bm, Hm, Skv, Wq]``)."""
-    mask = normalize(mask, batch, heads, s_q, s_kv)
-    return pack_rows(mask), pack_rows(mask.transpose(-1, -2))
-
-
-def tile_lists(mask: Tensor, batch: int, heads: int, rows: int, cols: int):
-    """Tile skipping for a normalized mask ``[Bm, Hm, Sq, Skv]``: for every (batch * head,
-    query tile of ``rows``) the key tiles of ``cols`` it must visit, as CSR (start int32
-    [B * H * nq], count, entries int32) plus per entry a class (bit h: the h-th 128-row
-    part of the query tile sees every key of it, so no mask is needed). Hidden tiles are
-    left out; a query tile that sees nothing keeps one (fully masked) entry, so every
-    tile runs at least one step."""
-    bm, hm, s_q, s_kv = mask.shape
-    nq, nk = -(-s_q // rows), -(-s_kv // cols)
-    parts = rows // TILE
-    visible = torch.zeros(bm, hm, nq * rows, nk * cols, dtype=torch.bool, device=mask.device)
-    visible[:, :, :s_q, :s_kv] = mask
-    full = torch.ones_like(visible)  # rows past Sq do not spoil a full tile; keys past Skv do
-    full[:, :, :, s_kv:] = False
-    full[:, :, :s_q, :s_kv] = mask
-    tiles = visible.view(bm, hm, nq, rows, nk, cols)
-    any_ = tiles.any(dim=5).any(dim=3)  # [Bm, Hm, nq, nk]
-    empty = ~any_.any(dim=-1, keepdim=True)
-    first = torch.zeros_like(any_)
+def _csr(listed: Tensor, classes: Tensor, batch: int, heads: int):
+    """CSR over ``listed [Bm, Hm, R, C]`` (bool) per (batch * head, row), with the per-entry
+    ``classes``; a row with nothing listed keeps column 0, so every row runs one step."""
+    empty = ~listed.any(dim=-1, keepdim=True)
+    first = torch.zeros_like(listed)
     first[..., 0] = True
-    listed = any_ | (empty & first)
-    whole = (
-        full.view(bm, hm, nq, parts, TILE, nk, cols).all(dim=6).all(dim=4)
-    )  # [.., nq, parts, nk]
-    cls = sum(whole[:, :, :, p].to(torch.int32) << p for p in range(parts))  # [Bm, Hm, nq, nk]
-    # expand the broadcast slices to every (batch, head), then CSR over the listed tiles
-    listed = listed.expand(batch, heads, nq, nk).reshape(batch * heads * nq, nk)
-    cls = cls.expand(batch, heads, nq, nk).reshape(batch * heads * nq, nk)
+    listed = listed | (empty & first)
+    n_rows, n_cols = listed.shape[-2:]
+    listed = listed.expand(batch, heads, n_rows, n_cols).reshape(-1, n_cols)
+    classes = classes.expand(batch, heads, n_rows, n_cols).reshape(-1, n_cols)
     count = listed.sum(dim=1).to(torch.int32)
     start = (count.cumsum(0) - count).to(torch.int32)
-    entries = listed.nonzero()[:, 1].to(torch.int32).contiguous()
-    classes = cls[listed].to(torch.int32).contiguous()
-    return start.contiguous(), count.contiguous(), entries, classes, nq
+    entries = listed.nonzero()[:, 1].to(torch.int32)
+    return (
+        start.contiguous(),
+        count.contiguous(),
+        entries.contiguous(),
+        classes[listed].to(torch.int32).contiguous(),
+    )
 
 
 class PackedMask:
@@ -88,11 +100,26 @@ class PackedMask:
     def __init__(self, mask: Tensor, batch: int, heads: int, s_q: int, s_kv: int) -> None:
         dense = normalize(mask, batch, heads, s_q, s_kv)
         self.shape = (batch, heads, s_q, s_kv)
-        self.words = pack_rows(dense)
-        self.words_t = pack_rows(dense.transpose(-1, -2))
-        self.lists = tile_lists(dense, batch, heads, 256, TILE)[:4]
-        # the backward walks query tiles per key tile: the transposed lists
-        self.lists_t = tile_lists(dense.transpose(-1, -2), batch, heads, TILE, TILE)[:4]
+        bm, hm = dense.shape[:2]
+        nq, nk = -(-s_q // TILE), -(-s_kv // TILE)
+        device = dense.device
+        self.words = torch.empty(bm, hm, s_q, nk * 4, dtype=torch.int32, device=device)
+        self.words_t = torch.empty(bm, hm, s_kv, nq * 4, dtype=torch.int32, device=device)
+        any_ = torch.empty(bm, hm, nq, nk, dtype=torch.int8, device=device)
+        all_ = torch.empty_like(any_)
+        _pack_kernel[(bm * hm, nq, nk)](
+            dense.view(torch.uint8), self.words, self.words_t, any_, all_, s_q, s_kv, hm,
+            *dense.stride(), nq, nk, BLOCK=TILE,
+        )  # fmt: skip
+        any_, all_ = any_.bool(), all_.bool()
+        # forward: 256-row query tiles (two 128-row parts) per key tile
+        pad = nq % 2
+        any_q = torch.nn.functional.pad(any_, (0, 0, 0, pad)).unflatten(2, (-1, 2))
+        all_q = torch.nn.functional.pad(all_, (0, 0, 0, pad), value=True).unflatten(2, (-1, 2))
+        classes = all_q[:, :, :, 0].int() | (all_q[:, :, :, 1].int() << 1)
+        self.lists = _csr(any_q.any(dim=3), classes, batch, heads)
+        # backward: 128-query tiles per key tile (the transpose)
+        self.lists_t = _csr(any_.transpose(-1, -2), all_.transpose(-1, -2).int(), batch, heads)
 
 
 def pack_mask(mask: Tensor, batch: int, heads: int, s_q: int, s_kv: int) -> PackedMask:
