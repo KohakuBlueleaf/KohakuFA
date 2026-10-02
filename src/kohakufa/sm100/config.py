@@ -154,7 +154,12 @@ class BackwardConfig:
     columns (FA4's layout; needed above D = 64, at the price of dP^T(i + 1) waiting for
     dQ(i) to be read out). ``kv_bufs`` K / V tiles (2: the next tile loads during this
     one); ``q_slots`` / ``do_slots`` Q (+ statistics) and dO buffers (the loads run that
-    many steps ahead)."""
+    many steps ahead).
+
+    ``stream`` (wide heads, ALIAS layout): ``nsl`` CTAs per key tile, each computing an
+    output slice of ``nw`` head-dim chunks of dK, dV, dQ (S^T and dP^T recomputed by
+    each); K resident (``k_res``: all of it, else the slice's chunks), the other operands
+    streamed through a ring of ``do_slots`` chunks; ``q_slots`` statistics slots."""
 
     dc: int
     nch: int
@@ -167,8 +172,14 @@ class BackwardConfig:
     small_regs: int = 32  # the one-warp mma and load partitions
     reduce_cols: int = 0  # fp32 dQ columns per TMA reduce-add (0: min(DC, 32)) ...
     reduce_stages: int = 1  # ... through a ring of this many [TILE, reduce_cols] buffers
+    stream: bool = False
+    nsl: int = 1
+    nw: int = 0  # 0: nch (no slicing)
+    k_res: bool = True
 
     def __post_init__(self):
+        if not self.nw:
+            object.__setattr__(self, "nw", self.nch)
         if not self.reduce_cols:
             object.__setattr__(self, "reduce_cols", min(self.dc, 32))
         if not self.p_regs:  # without ALIAS the dS warpgroup holds dP^T (128 fp32)
@@ -182,26 +193,33 @@ class BackwardConfig:
 
     def tmem_columns(self) -> int:
         scores = 2 * TILE  # S^T, dP^T
-        acc = 1 << (self.head_dim - 1).bit_length()  # TMEM blocks are powers of two
+        acc = 1 << (self.nw * self.dc - 1).bit_length()  # TMEM blocks are powers of two
         if self.alias:
             return scores + 2 * acc  # dV, dK (P^T in S^T, dQ in dP^T)
         return scores + TILE // 2 + 3 * acc  # P^T (16-bit), dV, dK, dQ
 
     def smem_bytes(self, elem_bytes: int = 2) -> int:
-        tiles = (2 * self.kv_bufs + self.q_slots + self.do_slots) * TILE * self.head_dim
+        if self.stream:  # resident K + the chunk ring
+            k_chunks = self.nch if self.k_res else self.nw
+            tiles = (k_chunks + self.do_slots) * TILE * self.dc
+        else:
+            tiles = (2 * self.kv_bufs + self.q_slots + self.do_slots) * TILE * self.head_dim
         ds = TILE * TILE  # dS^T
         staging = TILE * self.reduce_cols * 4 * self.reduce_stages
         stats = 3 * self.q_slots * TILE * 4
         return (tiles + ds) * elem_bytes + staging + stats + SMEM_RESERVED
 
     def legal(self, elem_bytes: int = 2) -> bool:
-        # the 3D aliased dQ view needs D <= 128 (it lives in the 128 dP^T columns)
-        if self.alias and self.head_dim > TILE:
+        # the aliased dQ (of the slice) lives in the 128 dP^T columns
+        if self.alias and self.nw * self.dc > TILE:
             return False
+        if self.stream and not (self.alias and self.nsl * self.nw >= self.nch):
+            return False
+        slots_ok = self.do_slots >= 1 if self.stream else 1 <= self.do_slots <= self.q_slots
         return (
             self.tmem_columns() <= TMEM_COLUMNS
             and self.smem_bytes(elem_bytes) <= SMEM_BYTES
-            and 1 <= self.do_slots <= self.q_slots
+            and slots_ok
             and self.dc % self.reduce_cols == 0
             # the staging ring doubles as the [TILE, DC] 16-bit dK / dV store buffer
             and self.reduce_stages * self.reduce_cols * 4 >= self.dc * elem_bytes
@@ -211,7 +229,10 @@ class BackwardConfig:
 def backward_configs(head_dim: int, elem_bytes: int = 2):
     """Every legal backward configuration for ``head_dim``, in default preference order:
     no aliasing, then Q at least double-buffered (the loads run ahead), double-buffered
-    K / V, deeper Q, then dO buffering."""
+    K / V, deeper Q, then dO buffering; above D = 128 the streamed, sliced kernel."""
+    if head_dim > TILE:
+        yield from _stream_configs(head_dim, elem_bytes)
+        return
     dc = chunk_of(head_dim)
     buffering = ((2, 3), (1, 3), (2, 2), (1, 2), (2, 1), (1, 1))  # (kv_bufs, q_slots)
     for alias in (False, True):
@@ -220,6 +241,31 @@ def backward_configs(head_dim: int, elem_bytes: int = 2):
                 cfg = BackwardConfig(dc, head_dim // dc, alias, kv_bufs, q_slots, do_slots)
                 if cfg.legal(elem_bytes):
                     yield cfg
+
+
+def _stream_configs(head_dim: int, elem_bytes: int):
+    """STREAM configurations (128-wide output slices, the last may be narrower; each with
+    its deepest ring <= 12) in preference order: 64-element chunks, fewest slices, a ring
+    of at least 6 chunks (measured: a shallower one starves the MMAs), all of K resident,
+    the deeper ring."""
+    configs = []
+    for dc in (c for c in CHUNKS if head_dim % c == 0):
+        nch = head_dim // dc
+        nw = min(TILE // dc, nch)
+        nsl = -(-nch // nw)
+        for k_res in (True, False):
+            for stats in (3, 2):
+                for ring in range(12, 1, -1):
+                    cfg = BackwardConfig(
+                        dc, nch, True, 1, stats, ring, stream=True, nsl=nsl, nw=nw, k_res=k_res
+                    )
+                    if cfg.legal(elem_bytes):
+                        configs.append(cfg)
+                        break
+    yield from sorted(
+        configs,
+        key=lambda c: (-c.dc, c.nsl, c.do_slots < 6, not c.k_res, -c.do_slots, -c.q_slots),
+    )
 
 
 def backward_config(head_dim: int, elem_bytes: int = 2) -> BackwardConfig:

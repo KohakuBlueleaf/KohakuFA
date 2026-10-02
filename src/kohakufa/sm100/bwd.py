@@ -115,11 +115,15 @@ class Problem:
     NCH: gl.constexpr
     ALIAS: gl.constexpr  # P^T in the S^T columns, dQ in the dP^T columns
     KV_BUFS: gl.constexpr
-    Q_SLOTS: gl.constexpr
-    DO_SLOTS: gl.constexpr
+    Q_SLOTS: gl.constexpr  # (STREAM: statistics slots)
+    DO_SLOTS: gl.constexpr  # (STREAM: ring slots)
     CAUSAL: gl.constexpr
     MASK: gl.constexpr
     VARLEN: gl.constexpr
+    STREAM: gl.constexpr  # wide heads: output slices, operands streamed by chunk
+    NSL: gl.constexpr  # output slices per key tile (CTAs sharing it)
+    NW: gl.constexpr  # head-dim chunks per output slice (the last may have fewer)
+    K_RES: gl.constexpr  # STREAM: all of K resident (else only the slice's chunks)
 
     @gluon.constexpr_function
     def __init__(
@@ -127,7 +131,8 @@ class Problem:
         mask_ptr, mask_b_stride, mask_h_stride, mask_words, stats_tiles, tiles_ptr,
         cu_q_ptr, cu_k_ptr, cu_qt_ptr, dk_ptr, dv_ptr, kv_row_stride, list_start_ptr,
         list_count_ptr, list_ptr, list_cls_ptr, k_tiles, list_rows,
-        DC, NCH, ALIAS, KV_BUFS, Q_SLOTS, DO_SLOTS, CAUSAL, MASK, VARLEN,
+        DC, NCH, ALIAS, KV_BUFS, Q_SLOTS, DO_SLOTS, CAUSAL, MASK, VARLEN, STREAM, NSL, NW,
+        K_RES,
     ):  # fmt: skip
         self.qk_scale = qk_scale
         self.heads = heads
@@ -165,13 +170,29 @@ class Problem:
         self.CAUSAL = gl.constexpr(CAUSAL)
         self.MASK = gl.constexpr(MASK)
         self.VARLEN = gl.constexpr(VARLEN)
+        self.STREAM = gl.constexpr(STREAM)
+        self.NSL = gl.constexpr(NSL)
+        self.NW = gl.constexpr(NW)
+        self.K_RES = gl.constexpr(K_RES)
 
     @gluon.jit
     def tile(self, tile_id):
-        """CTA tile ``tile_id``: its keys and the query tiles it visits."""
+        """CTA tile ``tile_id``: key tile ``tile_id // NSL`` and output slice ``tile_id %
+        NSL`` (head-dim chunks NW slice .. + NW - 1 of dK, dV, dQ)."""
+        info = self._key_tile(tile_id // self.NSL)
+        chunk0 = (tile_id % self.NSL) * self.NW
+        nw = gl.minimum(self.NCH - chunk0, self.NW)
+        return TileInfo(info.batch, info.head, info.kv_start, info.first_q, info.first_full,
+                        info.end_q, info.seq_q, info.seq_kv, info.q_off, info.k_off,
+                        info.qt_base, chunk0, nw)  # fmt: skip
+
+    @gluon.jit
+    def _key_tile(self, tile_id):
+        """Key tile ``tile_id``: its keys and the query tiles it visits."""
         if self.VARLEN:
             # the producer warps look ahead past the last tile: clamp (values unused)
-            entry = self.tiles_ptr + gl.minimum(tile_id, self.num_tiles - 1) * 3
+            last = self.num_tiles // self.NSL - 1
+            entry = self.tiles_ptr + gl.minimum(tile_id, last) * 3
             seq, head, kv_start = gl.load(entry), gl.load(entry + 1), gl.load(entry + 2)
             q_off = gl.load(self.cu_q_ptr + seq)
             seq_q = gl.load(self.cu_q_ptr + seq + 1) - q_off
@@ -207,8 +228,9 @@ class Problem:
         # the key tile holding padded keys runs every step masked (see _p_partition)
         if kv_start + TILE > seq_kv:
             first_full = num_q_tiles
+        zero = kv_start * 0
         return TileInfo(batch, head, kv_start, first_q, first_full, num_q_tiles,
-                        seq_q, seq_kv, q_off, k_off, qt_base)  # fmt: skip
+                        seq_q, seq_kv, q_off, k_off, qt_base, zero, zero)  # fmt: skip
 
     @gluon.jit
     def q_head(self, info, g):
@@ -280,17 +302,21 @@ class TileInfo:
     q_off: gl.tensor
     k_off: gl.tensor
     qt_base: gl.tensor
+    chunk0: gl.tensor  # first head-dim chunk of the output slice
+    nw: gl.tensor  # head-dim chunks in the output slice
 
     @gluon.constexpr_function
     def __init__(
         self, batch, head, kv_start, first_q, first_full, end_q, seq_q, seq_kv, q_off,
-        k_off, qt_base,
+        k_off, qt_base, chunk0, nw,
     ):  # fmt: skip
         self.seq_q = seq_q
         self.seq_kv = seq_kv
         self.q_off = q_off
         self.k_off = k_off
         self.qt_base = qt_base
+        self.chunk0 = chunk0
+        self.nw = nw
         self.batch = batch
         self.head = head
         self.kv_start = kv_start
@@ -469,6 +495,14 @@ def _whole(buffers, slot, p):
 
 @gluon.jit
 def _load_partition(k):
+    if k.problem.STREAM:
+        _load_stream(k)
+    else:
+        _load_resident(k)
+
+
+@gluon.jit
+def _load_resident(k):
     """K, V once per tile; Q_i (+ statistics) and dO_i per step into rotating slots."""
     p, sm, bars = k.problem, k.smem, k.bars
     NCH: gl.constexpr = p.NCH
@@ -593,6 +627,14 @@ def _issue_dk_dq(k, kv_slot, step, acc):
 
 @gluon.jit
 def _mma_partition(k):
+    if k.problem.STREAM:
+        _mma_stream(k)
+    else:
+        _mma_resident(k)
+
+
+@gluon.jit
+def _mma_resident(k):
     """Per tile: S^T(0), dP^T(0); then per step i (see module docstring) dV(i),
     S^T(i+1) once P(i) is in TMEM, and dP^T(i+1), dK(i), dQ(i) once dS(i) is in smem.
     ALIAS reorders: S^T(i+1) also waits for the dS warpgroup to have read P^T(i), and
@@ -647,6 +689,271 @@ def _mma_partition(k):
                 dq_count += 1
         tcgen05_commit(bars.dkv_ready.index(0))
         tcgen05_commit(bars.kv_free.index(kv_slot))
+        steps += n
+        tiles += 1  # noqa: SIM113 (Gluon has no enumerate)
+
+
+# --------------------------------------------------------------------------------------
+# STREAM (wide heads): output slices, operands streamed through a ring of chunks
+# --------------------------------------------------------------------------------------
+#
+# A CTA owns one key tile and one output slice (NW head-dim chunks of dK, dV, dQ); the
+# NSL slices of a key tile are separate CTAs, each recomputing S^T and dP^T over the
+# whole head dim. Tensor memory is the D = 128 ALIAS layout (S^T, dP^T, dV and dK of the
+# slice). K is resident (all of it, or the slice's chunks); everything else streams
+# through a ring of [TILE, DC] chunks in exactly the order the MMA warp consumes it:
+#
+#     per tile:  [S^T(0): (K_c), Q_c]  [dP^T(0): V_c, dO_c]
+#     per step:  dO_s(i)  [S^T(i+1): (K_c), Q_c]  Q_s(i)  [dP^T(i+1): V_c, dO_c]
+#
+# (dO_s, Q_s: the slice's chunks, loaded again for dV, dK). Every chunk is released
+# by the MMA that reads it, so the ring cannot deadlock at any depth. In the smem /
+# barrier aggregates: ``k`` holds the resident K, ``v`` (= ``q`` = ``do``) is the ring;
+# q_ready / q_free guard the statistics slots and do_ready / do_free the ring slots.
+
+
+@gluon.jit
+def _put(k, desc, coords, ring):
+    """Load one [TILE, DC] chunk into the next ring slot."""
+    RING: gl.constexpr = k.smem.v.shape[0]
+    slot = ring % RING
+    _wait_free(k.bars.do_free.index(slot), ring // RING)
+    ready = k.bars.do_ready.index(slot)
+    mbarrier.expect(ready, desc.block_type.nbytes)
+    tma.async_copy_global_to_shared(desc, coords, ready, k.smem.v.index(slot))
+    return ring + 1
+
+
+@gluon.jit
+def _take(k, ring):
+    """The ring slot of the next chunk, once loaded."""
+    RING: gl.constexpr = k.smem.v.shape[0]
+    slot = ring % RING
+    _wait_ready(k.bars.do_ready.index(slot), ring // RING)
+    return slot, ring + 1
+
+
+@gluon.jit
+def _free(k, slot):
+    """Release a ring slot when the MMAs issued so far (the one reading it) are done."""
+    tcgen05_commit(k.bars.do_free.index(slot))
+
+
+@gluon.jit
+def _step_of(p, info, g, start, count, index):
+    """(query head, query tile) of position ``index`` of query head ``g``'s range."""
+    return p.q_head(info, g), p.visit(info, start, count, index)
+
+
+@gluon.jit
+def _advance(p, info, g, start, count, index):
+    """The step after (g, index): the next index, or the next query head's first."""
+    index += 1
+    while (index == count) & (g + 1 < p.group):
+        g += 1
+        start, count = p.q_range(info, g)
+        index = 0
+    return g, start, count, index
+
+
+@gluon.jit
+def _load_s(k, info, q_head, i, step, ring):
+    """Statistics of query tile ``i`` and the chunks of S^T = K Q^T (K_c if not
+    resident, Q_c)."""
+    p, sm, bars = k.problem, k.smem, k.bars
+    slot = step % p.Q_SLOTS
+    _wait_free(bars.q_free.index(slot), step // p.Q_SLOTS)
+    ready = bars.q_ready.index(slot)
+    mbarrier.expect(ready, STATS * k.stats_desc.block_type.nbytes)
+    stats_row = (info.batch * p.heads + q_head) * p.stats_tiles + info.qt_base + i
+    for which in gl.static_range(STATS):
+        tma.async_copy_global_to_shared(
+            k.stats_desc, [(stats_row * STATS + which) * TILE], ready,
+            sm.stats.index(STATS * slot + which),
+        )  # fmt: skip
+    for c in gl.static_range(p.NCH):
+        if not p.K_RES:
+            coords = [info.batch, info.head, info.k_off + info.kv_start, c * p.DC]
+            ring = _put(k, k.k_desc, coords, ring)
+        coords = [info.batch, q_head, info.q_off + i * TILE, c * p.DC]
+        ring = _put(k, k.q_desc, coords, ring)
+    return ring
+
+
+@gluon.jit
+def _load_dp(k, info, q_head, i, ring):
+    """The chunks of dP^T = V dO^T (V_c, dO_c)."""
+    p = k.problem
+    for c in gl.static_range(p.NCH):
+        coords = [info.batch, info.head, info.k_off + info.kv_start, c * p.DC]
+        ring = _put(k, k.v_desc, coords, ring)
+        coords = [info.batch, q_head, info.q_off + i * TILE, c * p.DC]
+        ring = _put(k, k.do_desc, coords, ring)
+    return ring
+
+
+@gluon.jit
+def _load_slice(k, desc, info, q_head, i, ring):
+    """The output slice's NW chunks of Q or dO (past the head dim: zeros)."""
+    p = k.problem
+    for c in gl.static_range(p.NW):
+        coords = [info.batch, q_head, info.q_off + i * TILE, (info.chunk0 + c) * p.DC]
+        ring = _put(k, desc, coords, ring)
+    return ring
+
+
+@gluon.jit
+def _load_stream(k):
+    """STREAM loader: resident K once per tile, then the ring in consumption order."""
+    p, sm, bars = k.problem, k.smem, k.bars
+    K_CH: gl.constexpr = sm.k.shape[0]
+    tiles = 0
+    steps = 0
+    ring = 0
+    for tile_id in range(gl.program_id(0), p.num_tiles, gl.num_programs(0)):
+        info = p.tile(tile_id)
+        _wait_free(bars.kv_free.index(0), tiles)
+        ready = bars.kv_ready.index(0)
+        mbarrier.expect(ready, K_CH * k.k_desc.block_type.nbytes)
+        first = 0 if p.K_RES else info.chunk0
+        for c in gl.static_range(K_CH):
+            coords = [info.batch, info.head, info.k_off + info.kv_start, (first + c) * p.DC]
+            tma.async_copy_global_to_shared(k.k_desc, coords, ready, sm.k.index(c))
+        tiles += 1  # noqa: SIM113 (Gluon has no enumerate)
+        n = p.steps_of(info)
+        g = info.kv_start * 0
+        start, count = p.q_range(info, 0)
+        index = g
+        while (index == count) & (g + 1 < p.group):  # (MASK: heads with no listed tile)
+            g += 1
+            start, count = p.q_range(info, g)
+        q_head, i = _step_of(p, info, g, start, count, index)
+        if n > 0:
+            ring = _load_s(k, info, q_head, i, steps, ring)
+            ring = _load_dp(k, info, q_head, i, ring)
+        for t in range(n):
+            g, start, count, index = _advance(p, info, g, start, count, index)
+            next_head, next_i = _step_of(p, info, g, start, count, index)
+            ring = _load_slice(k, k.do_desc, info, q_head, i, ring)  # dO_s(t)
+            if t + 1 < n:
+                ring = _load_s(k, info, next_head, next_i, steps + 1, ring)
+            ring = _load_slice(k, k.q_desc, info, q_head, i, ring)  # Q_s(t)
+            if t + 1 < n:
+                ring = _load_dp(k, info, next_head, next_i, ring)
+            q_head = next_head
+            i = next_i
+            steps += 1
+
+
+@gluon.jit
+def _mma_s(k, step, ring):
+    """S^T(step) = sum_c K_c Q_c^T."""
+    p, sm, bars = k.problem, k.smem, k.bars
+    DC: gl.constexpr = p.DC
+    slot = step % p.Q_SLOTS
+    _wait_ready(bars.q_ready.index(slot), step // p.Q_SLOTS)  # statistics, for the P warps
+    for c in gl.static_range(p.NCH):
+        if p.K_RES:
+            k_tile = _matrix(sm.k.index(c), TILE, DC)
+        else:
+            k_slot, ring = _take(k, ring)
+            k_tile = _matrix(sm.v.index(k_slot), TILE, DC)
+        q_slot, ring = _take(k, ring)
+        q_tile = _matrix(sm.v.index(q_slot), TILE, DC).permute((1, 0))
+        signal = [bars.s_ready.index(0)] if c == p.NCH - 1 else None
+        tcgen05_mma(k_tile, q_tile, k.tmem.s, use_acc=c > 0, mbarriers=signal)
+        _free(k, q_slot)
+        if not p.K_RES:
+            _free(k, k_slot)
+    return ring
+
+
+@gluon.jit
+def _mma_dp(k, ring):
+    """dP^T = sum_c V_c dO_c^T."""
+    p, sm, bars = k.problem, k.smem, k.bars
+    DC: gl.constexpr = p.DC
+    for c in gl.static_range(p.NCH):
+        v_slot, ring = _take(k, ring)
+        do_slot, ring = _take(k, ring)
+        v_tile = _matrix(sm.v.index(v_slot), TILE, DC)
+        do_tile = _matrix(sm.v.index(do_slot), TILE, DC).permute((1, 0))
+        signal = [bars.dp_ready.index(0)] if c == p.NCH - 1 else None
+        tcgen05_mma(v_tile, do_tile, k.tmem.dp, use_acc=c > 0, mbarriers=signal)
+        _free(k, v_slot)
+        _free(k, do_slot)
+    return ring
+
+
+@gluon.jit
+def _mma_dv(k, ring, acc):
+    """dV_s += P^T dO_s, chunk by chunk."""
+    p, sm, tm = k.problem, k.smem, k.tmem
+    DC: gl.constexpr = p.DC
+    for c in gl.static_range(p.NW):
+        slot, ring = _take(k, ring)
+        tcgen05_mma(tm.p, _matrix(sm.v.index(slot), TILE, DC), tm.dv.slice(c * DC, DC), use_acc=acc)
+        _free(k, slot)
+    return ring
+
+
+@gluon.jit
+def _mma_dk_dq(k, info, ring, step, acc):
+    """dK_s += dS^T Q_s and dQ_s(step) = dS K_s; releases dS^T and the statistics slot
+    and signals dQ_s(step)."""
+    p, sm, bars, tm = k.problem, k.smem, k.bars, k.tmem
+    DC: gl.constexpr = p.DC
+    for c in gl.static_range(p.NW):
+        slot, ring = _take(k, ring)
+        tcgen05_mma(
+            sm.ds, _matrix(sm.v.index(slot), TILE, DC), tm.dk.slice(c * DC, DC), use_acc=acc
+        )
+        _free(k, slot)
+    done = [bars.dq_ready.index(0), bars.ds_free.index(0), bars.q_free.index(step % p.Q_SLOTS)]
+    for c in gl.static_range(p.NW):
+        if p.K_RES:
+            k_tile = _matrix(sm.k.index(info.chunk0 + c), TILE, DC)
+        else:
+            k_tile = _matrix(sm.k.index(c), TILE, DC)
+        signal = done if c == p.NW - 1 else None
+        tcgen05_mma(sm.ds.permute((1, 0)), k_tile, tm.dq.slice(c * DC, DC), use_acc=False,
+                    mbarriers=signal)  # fmt: skip
+    return ring
+
+
+@gluon.jit
+def _mma_stream(k):
+    """STREAM MMA issuer: the ALIAS order of _mma_resident with streamed operands."""
+    p, bars = k.problem, k.bars
+    tiles = 0
+    steps = 0
+    ring = 0
+    dq_count = 0
+    for tile_id in range(gl.program_id(0), p.num_tiles, gl.num_programs(0)):
+        info = p.tile(tile_id)
+        n = p.steps_of(info)
+        _wait_ready(bars.kv_ready.index(0), tiles)
+        if n > 0:
+            ring = _mma_s(k, steps, ring)
+            _wait_free(bars.dq_free.index(0), dq_count)  # dQ(steps - 1) read out
+            ring = _mma_dp(k, ring)
+        for t in range(n):
+            step = steps + t
+            _wait_ready(bars.p_ready.index(0), step)
+            if t == 0:
+                _wait_free(bars.dkv_free.index(0), tiles)  # last tile's dK, dV read
+            ring = _mma_dv(k, ring, t > 0)
+            if t + 1 < n:
+                ring = _mma_s(k, step + 1, ring)
+            _wait_ready(bars.ds_ready.index(0), step)
+            _wait_free(bars.dq_free.index(0), dq_count)
+            ring = _mma_dk_dq(k, info, ring, step, t > 0)
+            dq_count += 1
+            if t + 1 < n:
+                _wait_free(bars.dq_free.index(0), dq_count)  # dQ(t) read out
+                ring = _mma_dp(k, ring)
+        tcgen05_commit(bars.dkv_ready.index(0))
+        tcgen05_commit(bars.kv_free.index(0))
         steps += n
         tiles += 1  # noqa: SIM113 (Gluon has no enumerate)
 
@@ -856,36 +1163,41 @@ def _reduce_partition(k):
                 # all of dQ(i) to registers first: its TMEM (under ALIAS the dP^T
                 # columns) is free for the next step at once
                 parts = ()
-                for c in gl.static_range(p.NCH):
+                for c in gl.static_range(p.NW):
                     for r in gl.static_range(DC // RED):
                         parts = parts + (tm.dq.slice(c * DC + r * RED, RED).load(red_regs),)
                 mbarrier.arrive(bars.dq_free.index(0), count=1)
-                for c in gl.static_range(p.NCH):
-                    for r in gl.static_range(DC // RED):
-                        coords = [info.batch, q_head, row, c * DC + r * RED]
-                        _stage_reduce(k, parts[c * (DC // RED) + r], coords, reduces)
-                        reduces += 1
+                for c in gl.static_range(p.NW):
+                    if c < info.nw:  # (the last slice may be narrower)
+                        for r in gl.static_range(DC // RED):
+                            column = (info.chunk0 + c) * DC + r * RED
+                            coords = [info.batch, q_head, row, column]
+                            _stage_reduce(k, parts[c * (DC // RED) + r], coords, reduces)
+                            reduces += 1
                 dq_count += 1
 
         _wait_ready(bars.dkv_ready.index(0), tiles)
         tiles += 1  # noqa: SIM113 (Gluon has no enumerate)
-        for c in gl.static_range(p.NCH):
+        for c in gl.static_range(p.NW):
             dv = tm.dv.slice(c * DC, DC).load(regs)
             dk = tm.dk.slice(c * DC, DC).load(regs) * scale
-            if c == p.NCH - 1:
+            if c == p.NW - 1:
                 mbarrier.arrive(bars.dkv_free.index(0), count=1)
-            if p.VARLEN and info.kv_start + TILE > info.seq_kv:
+            column = (info.chunk0 + c) * DC
+            if c >= info.nw:
+                pass  # past the end of a narrower last slice
+            elif p.VARLEN and info.kv_start + TILE > info.seq_kv:
                 # the sequence ends inside this key tile: a full TMA box would overwrite
                 # the next sequence's rows, so store row-masked from registers
                 keys = info.kv_start + gl.arange(0, TILE, layout=gl.SliceLayout(1, regs))
-                cols = c * DC + gl.arange(0, DC, layout=gl.SliceLayout(0, regs))
+                cols = column + gl.arange(0, DC, layout=gl.SliceLayout(0, regs))
                 packed = (info.k_off + keys).to(gl.int64) * p.kv_row_stride
                 offsets = packed[:, None] + (info.head * p.HEAD_DIM + cols)[None, :]
                 ok = (keys < info.seq_kv)[:, None]
                 gl.store(p.dv_ptr + offsets, dv.to(p.dv_ptr.dtype.element_ty), mask=ok)
                 gl.store(p.dk_ptr + offsets, dk.to(p.dk_ptr.dtype.element_ty), mask=ok)
             else:
-                coords = [info.batch, info.head, info.k_off + info.kv_start, c * DC]
+                coords = [info.batch, info.head, info.k_off + info.kv_start, column]
                 tma.store_wait(pendings=0)
                 _matrix(out16, TILE, DC).store(dv.to(k.dk_desc.block_type.element_ty))
                 fence_async_shared()
@@ -942,7 +1254,8 @@ def attention_bwd_kernel(
     DC: gl.constexpr, NCH: gl.constexpr, ALIAS: gl.constexpr, KV_BUFS: gl.constexpr,
     Q_SLOTS: gl.constexpr, DO_SLOTS: gl.constexpr, P_REGS: gl.constexpr,
     DS_REGS: gl.constexpr, SMALL_REGS: gl.constexpr, RSTAGES: gl.constexpr, CAUSAL: gl.constexpr,
-    MASK: gl.constexpr, VARLEN: gl.constexpr,
+    MASK: gl.constexpr, VARLEN: gl.constexpr, STREAM: gl.constexpr, NSL: gl.constexpr,
+    NW: gl.constexpr, K_RES: gl.constexpr,
 ):  # fmt: skip
     problem = Problem(
         gl.to_tensor(qk_scale), gl.to_tensor(heads), gl.to_tensor(group),
@@ -953,18 +1266,28 @@ def attention_bwd_kernel(
         tiles_ptr, cu_q_ptr, cu_k_ptr, cu_qt_ptr, dk_ptr, dv_ptr, gl.to_tensor(kv_row_stride),
         list_start_ptr, list_count_ptr, list_ptr, list_cls_ptr, gl.to_tensor(k_tiles),
         gl.to_tensor(list_rows),
-        DC, NCH, ALIAS, KV_BUFS, Q_SLOTS, DO_SLOTS, CAUSAL, MASK, VARLEN,
+        DC, NCH, ALIAS, KV_BUFS, Q_SLOTS, DO_SLOTS, CAUSAL, MASK, VARLEN, STREAM, NSL, NW,
+        K_RES,
     )  # fmt: skip
     # head-dim chunks are separate buffers: [slot * NCH + chunk, 1, 1, TILE, DC]
     box: gl.constexpr = [1, 1, TILE, DC]
     # 64-byte swizzle: compute threads store dS^T in 32-column slices
     ds_layout: gl.constexpr = gl.NVMMASharedLayout(64, 16, rank=2)
     dtype: gl.constexpr = q_desc.block_type.element_ty  # fp16 or bf16 operands
+    if STREAM:  # resident K (all, or the slice's chunks) and the chunk ring
+        k_res = gl.allocate_shared_memory(dtype, [NCH if K_RES else NW] + box, k_desc.layout)
+        ring = gl.allocate_shared_memory(dtype, [DO_SLOTS] + box, v_desc.layout)
+        smem_k, smem_v, smem_q, smem_do = k_res, ring, ring, ring
+    else:
+        smem_k = gl.allocate_shared_memory(dtype, [KV_BUFS * NCH] + box, k_desc.layout)
+        smem_v = gl.allocate_shared_memory(dtype, [KV_BUFS * NCH] + box, v_desc.layout)
+        smem_q = gl.allocate_shared_memory(dtype, [Q_SLOTS * NCH] + box, q_desc.layout)
+        smem_do = gl.allocate_shared_memory(dtype, [DO_SLOTS * NCH] + box, do_desc.layout)
     smem = Smem(
-        gl.allocate_shared_memory(dtype, [KV_BUFS * NCH] + box, k_desc.layout),
-        gl.allocate_shared_memory(dtype, [KV_BUFS * NCH] + box, v_desc.layout),
-        gl.allocate_shared_memory(dtype, [Q_SLOTS * NCH] + box, q_desc.layout),
-        gl.allocate_shared_memory(dtype, [DO_SLOTS * NCH] + box, do_desc.layout),
+        smem_k,
+        smem_v,
+        smem_q,
+        smem_do,
         gl.allocate_shared_memory(dtype, [TILE, TILE], ds_layout),
         gl.allocate_shared_memory(gl.float32, [RSTAGES] + dq_desc.block_type.shape, dq_desc.layout),
         gl.allocate_shared_memory(gl.float32, [STATS * Q_SLOTS, TILE], stats_desc.layout),
@@ -978,7 +1301,7 @@ def attention_bwd_kernel(
     )  # fmt: skip
     fence_async_shared()
     scores: gl.constexpr = TensorMemoryLayout([TILE, TILE], col_stride=1)
-    DPAD: gl.constexpr = triton.next_power_of_2(DC * NCH)  # TMEM blocks: powers of two
+    DPAD: gl.constexpr = triton.next_power_of_2(DC * NW)  # TMEM blocks: powers of two
     acc: gl.constexpr = TensorMemoryLayout([TILE, DPAD], col_stride=1)
     s_tmem = allocate_tensor_memory(gl.float32, [TILE, TILE], scores)
     dp_tmem = allocate_tensor_memory(gl.float32, [TILE, TILE], scores)
@@ -986,7 +1309,7 @@ def attention_bwd_kernel(
         # P^T (16-bit, two per column) in the first half of the S^T columns; dQ's NCH
         # [TILE, DC] blocks in the dP^T columns
         p_tmem = s_tmem.slice(0, TILE // 2)._reinterpret(dtype, [TILE, TILE], scores)
-        dq_tmem = dp_tmem  # D <= 128
+        dq_tmem = dp_tmem  # D (STREAM: the slice) <= 128
     else:
         p_tmem = allocate_tensor_memory(dtype, [TILE, TILE], scores)
         dq_tmem = allocate_tensor_memory(gl.float32, [TILE, DPAD], acc)
@@ -1136,7 +1459,7 @@ def attention_backward(
     dv = alloc(batch, seq_kv, kv_heads, dim, device=device, dtype=q.dtype)
     dk, dv = dk.transpose(1, 2), dv.transpose(1, 2)
     num_kv_tiles = triton.cdiv(seen_kv, TILE_ROWS)
-    num_tiles = batch * kv_heads * num_kv_tiles
+    num_tiles = batch * kv_heads * num_kv_tiles * cfg.nsl
     grid = (min(num_tiles, sm_count(device)),)
     attention_bwd_kernel[grid](
         *(tma_descriptor(t, TILE_ROWS, cfg.dc) for t in (q, k, v, dout, dk, dv)),
@@ -1178,6 +1501,10 @@ def _constexprs(cfg) -> dict:
         "DS_REGS": cfg.ds_regs,
         "SMALL_REGS": cfg.small_regs,
         "RSTAGES": cfg.reduce_stages,
+        "STREAM": cfg.stream,
+        "NSL": cfg.nsl,
+        "NW": cfg.nw,
+        "K_RES": cfg.k_res,
     }
 
 
@@ -1299,7 +1626,7 @@ def attention_backward_varlen(
     dk = torch.zeros_like(k)  # keys no query sees keep 0
     dv = torch.zeros_like(v)
     q4, k4, v4, do4, dk4, dv4 = (t.unsqueeze(0).transpose(1, 2) for t in (q, k, v, dout, dk, dv))
-    num_tiles = key_tiles.shape[0]
+    num_tiles = key_tiles.shape[0] * cfg.nsl
     if num_tiles and total_q_tiles:
         attention_bwd_kernel[(min(num_tiles, sm_count(device)),)](
             *(tma_descriptor(t, TILE_ROWS, cfg.dc) for t in (q4, k4, v4, do4, dk4, dv4)),

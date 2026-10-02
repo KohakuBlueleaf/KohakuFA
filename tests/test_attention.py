@@ -375,7 +375,16 @@ def test_head_dims(dim, causal):
     check(got, reference(q, k, v, dout, dim**-0.5, block=1 if causal else 0))
 
 
-@pytest.mark.parametrize("dim", [96, 128])
+@pytest.mark.parametrize("dim", [192, 256, 320, 448, 512])
+@pytest.mark.parametrize("causal", [False, True])
+def test_wide_head_dims(dim, causal):
+    """Head dims 192 .. 512: one-half / value-split forward, sliced streamed backward
+    (320 and 448: a narrower last slice)."""
+    q, k, v, dout = inputs(1, 3, 300, 300, dim=dim, seed=dim)
+    check(run(q, k, v, dout, causal=causal), reference(q, k, v, dout, dim**-0.5, block=int(causal)))
+
+
+@pytest.mark.parametrize("dim", [96, 128, 256])
 def test_wide_heads_features(dim):
     """The aliased (D > 64) backward with block-causal GQA, a boolean mask in bf16, and
     varlen."""

@@ -22,7 +22,7 @@ import torch
 from torch import Tensor
 
 KERNEL_DIM_STEP = 16  # kernel head dims: multiples of 16 (chunks of 64 / 32 / 16)
-MAX_KERNEL_DIM = 128  # the backward's tensor memory: S^T, dP^T, dK, dV of 128 keys
+MAX_KERNEL_DIM = 512  # beyond 128: one-half / value-split forward, sliced streamed backward
 
 from kohakufa.mask import PackedMask
 from kohakufa.sm100.bwd import (
@@ -43,7 +43,7 @@ def _check(q: Tensor, k: Tensor, v: Tensor) -> None:
         raise TypeError("attention: q, k, v must be fp16 or bf16 (all the same)")
     dim = q.shape[-1]
     if dim % KERNEL_DIM_STEP or not 0 < dim <= MAX_KERNEL_DIM:
-        raise ValueError(f"attention: kernel head_dim {dim}: a multiple of 16 up to 128")
+        raise ValueError(f"attention: kernel head_dim {dim}: a multiple of 16 up to 512")
     if k.shape != v.shape or k.shape[0] != q.shape[0] or k.shape[-1] != q.shape[-1]:
         raise ValueError(
             f"attention: k {tuple(k.shape)} / v {tuple(v.shape)} vs q {tuple(q.shape)}"
