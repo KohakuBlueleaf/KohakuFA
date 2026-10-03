@@ -34,7 +34,9 @@ Seen in: FlashAttention-4 (`flash_fwd_sm100.py`: `lse = (row_max*scale_log2 +
 log2(row_sum)) * LN2`, then `flash_bwd_preprocess.py`: `lse_log2 = lse * LOG2_E`, then
 `flash_bwd_sm100.py`: `exp2(fma(S, scale_log2, -lse_log2))`; two extra roundings), and
 measured in PyTorch SDPA's cuDNN and memory-efficient backends (the latter even with
-fp32 inputs).
+fp32 inputs), and in PyTorch flex attention (`flex_attention.py.jinja`: `lse = m_i +
+tl.math.log2(l_i)`, one fp32 plane; on the synthetic sweep its dV error equals cuDNN's, 3.1e-3
+at logits 1e5, 2.5e-2 at 1e6 and 0.21 at 1e7, against KohakuFA's 2e-4 to 4e-4).
 
 ## 2. Scaling before shifting
 
@@ -72,6 +74,14 @@ it is only enabled on the sparse-MLA path. On its own it would not be enough: wi
 scale-before-shift exponent, a more precise `O` is *inconsistent* with the `P` the backward
 rebuilds, and in our emulation it made `dQ` / `dK` worse (cosine 0.35).
 
+PyTorch flex attention has a milder form (`common.py.jinja`): it multiplies every score by the
+scale and by `1 / ln 2` in fp32 first (`qk *= SM_SCALE`, `post_mod_scores *= RCP_LN2`), then
+subtracts the max of the *scaled* scores. The row's largest `P` is still exactly 1, but every
+score is rounded at its scaled magnitude before the shift, so near-tied keys with large logits
+lose their difference. On the synthetic sweep (near-ties by design) its dQ / dK track cuDNN's
+from logits of 1e4 up (dQ 7.2e-2 at 1e5, against 5.9e-3 for KohakuFA; in bf16 0.73 against
+3.5e-2); on pretrained DINOv3's first layer it stays on the floor, where cuDNN and FA4 do not.
+
 ## 3. Padded keys in the backward
 
 When `Skv` is not a multiple of the key tile, the last tile has zero-filled `K` / `V`
@@ -102,11 +112,11 @@ pretrained DINOv3 ViT-L/16 fine-tuned with a fixed 2^16 loss scale
 
 ![DINOv3 ViT-L/16 at loss scale 2^16](images/dinov3_l_training_scale2e16.png)
 
-cuDNN and the memory-efficient kernel leave the floor as training goes and reach about 4x it
-by 20k steps (median over layers: dQ 8.0e-3 against 2.1e-3, dK 1.3e-2 against 3.0e-3; worst
-layer dK 2.4e-2 against 7.8e-3); an fp64 emulation that rounds `scale * dS` to fp16 matches
-them to three digits. FA4 and KohakuFA round
-`dS` and apply the scale in fp32 afterwards, and stay on the floor.
+cuDNN and the memory-efficient kernel leave the floor as training goes and reach 4 to 6x it
+by 20k steps (median over layers: dQ 8.9e-3 against 2.4e-3, dK 1.4e-2 against 2.3e-3; worst
+layer dK 2.5e-2 against 7.9e-3); an fp64 emulation that rounds `scale * dS` to fp16 matches
+them to three digits. FA4, flex attention and KohakuFA round `dS` and apply the scale in fp32
+afterwards, and stay on the floor.
 
 **Fix:** round `dS`, not `scale * dS`; apply the scale to the fp32 `dQ` / `dK` accumulators.
 
@@ -139,6 +149,10 @@ is near one-hot (pretrained DINOv3 already has logits ~1e5 there), and during tr
 logits grew to 5e7. An emulation of the kernel's arithmetic in torch, toggling one
 rounding at a time, isolated the three causes above. See the README's production case
 for the plots.
+
+A community member later hit the same large-logit, wrong-gradient behaviour with PyTorch flex
+attention on an RTX PRO 6000 (cuDNN 9.10). We reproduced it on B300 with cuDNN 9.20: flex
+shares bug 1 and the milder form of bug 2 described above (synthetic sweep, `precision.py`).
 
 ## Reproducing
 

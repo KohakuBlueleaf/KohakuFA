@@ -19,10 +19,10 @@ fault, it was the attention kernel's.** The details are in [docs/precision.md](d
 Face Hub on a toy task and recompute each layer's attention backward with every kernel against
 fp64 (`benchmarks/dinov3_backward.py`). Worst layer's dK relative error, before any training step:
 
-| | cuDNN (PyTorch SDPA) | FlashAttention-4 | **KohakuFA** | correct-kernel floor |
-|---|---|---|---|---|
-| fp16 | 5.4e-2 (25x floor) | 5.5e-2 (26x) | **2.2e-3 (1.0x)** | 2.1e-3 |
-| bf16 | 5.0e-1 (54x floor) | 5.0e-1 (54x) | **9.5e-3 (1.0x)** | 9.3e-3 |
+| | cuDNN (PyTorch SDPA) | FlashAttention-4 | flex attention | **KohakuFA** | correct-kernel floor |
+|---|---|---|---|---|---|
+| fp16 | 5.4e-2 (25x floor) | 5.5e-2 (26x) | 2.2e-3 (1.0x) | **2.2e-3 (1.0x)** | 2.1e-3 |
+| bf16 | 5.0e-1 (54x floor) | 5.0e-1 (54x) | 9.4e-3 (1.0x) | **9.5e-3 (1.0x)** | 9.3e-3 |
 
 and through 20k fine-tuning steps, in fp16 and bf16 (bf16 does not hide the bug; it makes it
 larger):
@@ -31,6 +31,35 @@ larger):
 
 In a real fp16 video-model run these bugs decorrelated the trunk's gradients from the truth
 (cosine 0.01) and made the gradient norm creep up 10x; see [Precision](#precision).
+
+Flex attention is fine on this layer but not at larger logits: a community member hit the same
+large-logit, wrong-gradient behaviour with PyTorch flex attention on an RTX PRO 6000 (cuDNN 9.10),
+and we reproduced it on B300 (cuDNN 9.20). On the synthetic sweep below, flex's gradient errors
+match cuDNN's from logits of 1e4 up (dQ 7.2e-2 at 1e5 against KohakuFA's 5.9e-3; dV 0.21 at
+1e7 against 2e-4).
+
+### Why the gradients go wrong, and how KohakuFA fixes it
+
+Flash attention never stores the attention matrix: the backward **recomputes** the softmax
+probabilities `P` from the scores and a few numbers saved per query row. Pretrained ViTs learn
+near-one-hot attention in some layers (DINOv3's first layers reach logits of 1e5 out of the box,
+and training pushes them higher), and at those magnitudes fp32 has few bits left after the
+decimal point, so *how* those per-row numbers are kept and combined decides whether the
+recomputed `P` is right. A slip there is invisible in the forward (the output and the loss look
+fine) but is amplified in the backward, whose `dS = P (dP - delta)` is a difference of nearly
+equal terms in exactly those rows. Notation: `S = q k^T`, `c = scale * log2(e)`, `m` the row max,
+`l` the row sum.
+
+| | what goes wrong | effect | seen in | KohakuFA's fix |
+|---|---|---|---|---|
+| 1 | the row max and row sum are saved as **one** fp32 number, `c m + log2 l`; at large `c m` fp32 rounds `log2 l` away | the recomputed `P` no longer sums to 1: dV wrong directly, dQ / dK blow up | FA4, cuDNN, mem-efficient, flex | keep `m` and `log2 l` as two numbers |
+| 2 | the exponent is `fma(S, c, -c m)`, scale before shift: the row's largest `P` becomes `2^(rounding residual)` instead of exactly 1 | `O` carries that rounding error, so `delta = rowsum(dO O)` stops cancelling `dP`: dQ / dK wrong, **worse in bf16** | FA4, cuDNN; flex in a milder form (it scales every score before subtracting the max, so near-tied large logits lose their difference) | shift first, `(S - m) c`: exact near the max, the largest `P` is exactly 1 |
+| 3 | keys that pad a partial tile are left unmasked in the backward | their `P` overflows to `inf`, and `inf * 0 = NaN` lands in dQ | KohakuFA before the fix | the tile holding padded keys takes the masked path |
+| 4 | the softmax scale is folded into `dS` before it is rounded to fp16 | `log2(1 / scale)` bits of range lost to underflow (3 at head dim 64); grows as gradients shrink under a moderate loss scale | cuDNN, mem-efficient | round `dS`, apply the scale to the fp32 dQ / dK accumulators |
+
+Bugs 1 to 3 come from fp32 arithmetic inside the kernel, so they hit bf16 as hard as fp16 (bug 2
+harder); only bug 4 is fp16-specific. The fixes cost about 5% of attention time (one extra fp32
+operation per score). Full derivations, code and measurements: [docs/precision.md](docs/precision.md).
 
 ```python
 from kohakufa import attention, attention_varlen, pack_mask
@@ -122,19 +151,21 @@ the error.
 1.4e5) already breaks FA4 and cuDNN, in both dtypes (relative L2 error vs fp64, worst layer;
 the over-training figure is [at the top](#kohakufa)):
 
-| | cuDNN (SDPA) | FA4 | mem-efficient (SDPA) | KohakuFA | floor (correct kernel) | emulated: scale before shift |
-|---|---|---|---|---|---|---|
-| fp16 dQ | 1.0e-1 | 1.0e-1 | 5.7e-3 | 5.7e-3 | 5.5e-3 | 1.3e-1 |
-| fp16 dK | 5.4e-2 | 5.5e-2 | 2.2e-3 | 2.2e-3 | 2.1e-3 | 7.7e-2 |
-| bf16 dQ | **8.8e-1** | **8.7e-1** | 3.1e-2 | 3.1e-2 | 3.1e-2 | 1.1 |
-| bf16 dK | **5.0e-1** | **5.0e-1** | 9.5e-3 | 9.5e-3 | 9.3e-3 | 5.8e-1 |
+| | cuDNN (SDPA) | FA4 | mem-efficient (SDPA) | flex | KohakuFA | floor (correct kernel) | emulated: scale before shift |
+|---|---|---|---|---|---|---|---|
+| fp16 dQ | 1.0e-1 | 1.0e-1 | 5.7e-3 | 5.7e-3 | 5.7e-3 | 5.5e-3 | 1.3e-1 |
+| fp16 dK | 5.4e-2 | 5.5e-2 | 2.2e-3 | 2.2e-3 | 2.2e-3 | 2.1e-3 | 7.7e-2 |
+| bf16 dQ | **8.8e-1** | **8.7e-1** | 3.1e-2 | 3.1e-2 | 3.1e-2 | 3.1e-2 | 1.1 |
+| bf16 dK | **5.0e-1** | **5.0e-1** | 9.5e-3 | 9.4e-3 | 9.5e-3 | 9.3e-3 | 5.8e-1 |
 
 ![pretrained DINOv3 ViT-B/16, per layer](docs/images/dinov3_b_layers.png)
 
-* **FA4 and cuDNN fail the same way**: over the 21 probes, their worst layer is 2 to 26x above
+* **FA4 and cuDNN fail the same way**: over the 21 probes, their worst layer is 2.5 to 65x above
   the floor in fp16 and up to 54x in bf16, and the scale-before-shift emulation reproduces both
-  (bug 2 in [docs/precision.md](docs/precision.md)). KohakuFA stays within 0.7 to 1.2x of the
-  floor in both dtypes.
+  (bug 2 in [docs/precision.md](docs/precision.md)). KohakuFA stays within 1.2x of the floor at
+  most probes and at most 2.3x at a few, all in the near-one-hot layer 0, where the
+  memory-efficient kernel shows the same excess to three digits (rounding the emulated floor
+  leaves out, not a bug).
 * **bf16 does not help: it makes this bug 10x worse.** bf16 has fp32's range, but rounds the
   row's largest probability (`2^residual` instead of exactly 1) to 8 bits instead of 11, so `O`
   and the backward's `delta = rowsum(dO O)` are further off. Switching fp16 to bf16 hides
@@ -142,7 +173,7 @@ the over-training figure is [at the top](#kohakufa)):
 * The memory-efficient kernel is fine at these logits; its log-sum-exp bug (bug 1) needs logits
   past ~1e6, see [the synthetic sweep](#synthetic-sweep-where-each-kernel-breaks). It and cuDNN have a fourth, fp16-only bug
   (they round `scale * dS` instead of `dS`) that grows as fine-tuning shrinks the gradients at a
-  moderate loss scale: about 4x the floor on ViT-L/16 after 20k steps at 2^16
+  moderate loss scale: 4 to 6x the floor on ViT-L/16 after 20k steps at 2^16
   ([figure](docs/images/dinov3_l_training_scale2e16.png), bug 4 in
   [docs/precision.md](docs/precision.md)).
 * On ViT-L/16 the sharpest layer is milder (logits up to 3.4e4) and so is the damage: FA4 and
@@ -163,12 +194,13 @@ and some keys nearly tie, like an attention layer that learned a lookup.
 ![relative error vs logit magnitude](docs/images/precision_rel_err_j3e-2.png)
 
 * **dV** shows the log-sum-exp bug in isolation: KohakuFA (and FA2) stay at the fp16 floor
-  (~3e-4) up to 1e8, while FA4, cuDNN and the memory-efficient kernel climb past 1 and reach
+  (~3e-4) up to 1e8, while FA4, cuDNN, flex and the memory-efficient kernel climb past 1 and reach
   1e3.
 * **dQ / dK** are harder for *everyone*: above ~1e6 the gradient is genuinely ill-conditioned
   (near-tied keys with norms in the thousands make `dQ = sum_j dS_j k_j` cancel), and no fp16
   kernel is exact there, but KohakuFA degrades least: at 1e7, dQ relative error 0.3 against 3.5
-  (cuDNN), 4.2 (FA4) and 30 (FA2).
+  (cuDNN and flex), 4.2 (FA4) and 30 (FA2) on the tighter-cluster sweep
+  ([precision_rel_err](docs/images/precision_rel_err.png)).
 * The same sweep with max absolute error and with `1 - cosine` is in
   [precision_max_abs_err](docs/images/precision_max_abs_err_j3e-2.png) and
   [precision_one_minus_cos](docs/images/precision_one_minus_cos_j3e-2.png); per-row error

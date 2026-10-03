@@ -106,7 +106,7 @@ def main():
             q, k, v, dout = make_inputs(scale, jitter=args.jitter, dtype=dtype)
             want = reference(q, k, v, dout, mode)
             for name, (fn, modes) in KERNELS.items():
-                if mode not in modes or name == "flex":
+                if mode not in modes:
                     continue
                 try:
                     got = run(fn, q, k, v, dout, mode)

@@ -1,5 +1,5 @@
 """Attention backward error while fine-tuning a pretrained DINOv3 ViT, in fp16 AND bf16:
-PyTorch SDPA (cuDNN, memory-efficient), FlashAttention-4 and KohakuFA on the attention
+PyTorch SDPA (cuDNN, memory-efficient), flex attention, FlashAttention-4 and KohakuFA on the attention
 calls of a real training run, with each error attributed to a named kernel bug by fp64
 emulation.
 
@@ -59,8 +59,8 @@ try:
     from flash_attn.cute.interface import flash_attn_func as fa4_func
 except ImportError:
     fa4_func = None
-KERNELS = (*SDPA, "kohakufa", *(("fa4",) if fa4_func else ()))
-PROBED = ("cudnn", "efficient", *(("fa4",) if fa4_func else ()), "kohakufa")
+KERNELS = (*SDPA, "flex", "kohakufa", *(("fa4",) if fa4_func else ()))
+PROBED = ("cudnn", "efficient", "flex", *(("fa4",) if fa4_func else ()), "kohakufa")
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 EMULATED = ("floor", "scale*dS", "single lse", "scale-shift", "all three")
 FP16_MIN_NORMAL = 2.0**-14
@@ -128,11 +128,23 @@ class PatchDecoder(torch.nn.Module):
 
 # -- kernels ---------------------------------------------------------------------------------
 
+_FLEX = []
+
+
+def compiled_flex():
+    """flex_attention under torch.compile (eager flex runs an unfused reference)."""
+    if not _FLEX:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        torch._dynamo.config.recompile_limit = 64
+        _FLEX.append(torch.compile(flex_attention, dynamic=False))
+    return _FLEX[0]
+
 
 @contextmanager
 def use_kernel(name: str):
-    """Route every unmasked SDPA call to ``name``: an SDPA backend, FlashAttention-4 or
-    KohakuFA."""
+    """Route every unmasked SDPA call to ``name``: an SDPA backend, flex attention (compiled:
+    its Triton kernel), FlashAttention-4 or KohakuFA."""
     if name in SDPA:
         with sdpa_kernel([SDPA[name]]):
             yield
@@ -149,6 +161,9 @@ def use_kernel(name: str):
         if name == "kohakufa":
             return kohakufa.attention(q, k, v, scale=scale, compute_dtype=dtype)
         dtype = dtype or (q.dtype if q.dtype in DTYPES.values() else torch.float16)
+        if name == "flex":
+            q, k, v = (t.to(dtype) for t in (q, k, v))
+            return compiled_flex()(q, k, v, scale=scale)
         q, k, v = (t.to(dtype).transpose(1, 2) for t in (q, k, v))  # FA4: [B, S, H, D]
         out = fa4_func(q, k, v, softmax_scale=scale)
         return (out[0] if isinstance(out, tuple) else out).transpose(1, 2)

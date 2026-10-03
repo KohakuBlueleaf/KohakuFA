@@ -32,6 +32,7 @@ KERNELS = {  # probe name -> (label, color, marker)
     "cudnn": ("cuDNN (SDPA)", "#2ca02c", "^"),
     "fa4": ("FA4", "#9467bd", "D"),
     "efficient": ("mem-efficient (SDPA)", "#ff7f0e", "v"),
+    "flex": ("flex attention", "#7f7f7f", "x"),
     "kohakufa": ("KohakuFA", "#d62728", "o"),
 }
 FLOOR = "floor"
