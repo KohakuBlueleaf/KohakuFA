@@ -32,9 +32,11 @@ out = attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal=True)
 
 ## Why this library
 
-* **Correct backward at large logits.** Three precision bugs common in flash-attention kernels
+* **Correct backward at large logits.** Four precision bugs common in flash-attention kernels
   (a single fp32 log-sum-exp per row, scaling the scores before shifting them, unmasked padded
-  keys) are fixed here, with regression tests. See [the precision results](#precision).
+  keys, rounding `scale * dS` instead of `dS` to fp16) are fixed here. They hit bf16 as well,
+  one of them harder; see [the precision results](#precision) and
+  [stock DINOv3](#reproduce-it-on-stock-dinov3-in-fp16-and-bf16).
 * **Block-causal attention as a first-class mode.** Video and streaming models attend causally
   over *frames*, not tokens. KohakuFA classifies every tile as hidden / fully visible / boundary,
   never loads hidden tiles, and only masks boundary tiles: up to **4.7x** faster than
@@ -239,6 +241,54 @@ At the run's own attention call sites (effective TFLOPS, fwd and fwd+bwd):
 
 ![production call sites](docs/images/production_speed.png)
 
+## Reproduce it on stock DINOv3, in fp16 and bf16
+
+The production run is not a special setup. `benchmarks/dinov3_backward.py` takes the
+**pretrained DINOv3 ViT-B/16 and ViT-L/16 from the Hugging Face Hub**, fine-tunes them on a toy
+task (decode each patch token back to its RGB patch, 20k steps), and every 1k steps runs each
+layer's real attention inputs through every kernel, against fp64 on the same rounded inputs:
+fp16 with the run's live loss scale, and bf16 with none. Next to the kernels, fp64 emulations of
+a correct kernel ("floor") and of each bug in [docs/precision.md](docs/precision.md) attribute
+the error.
+
+**Before a single training step**, the pretrained ViT-B/16's first attention layer (logits up to
+1.4e5) already breaks FA4 and cuDNN, in both dtypes (relative L2 error vs fp64, worst layer):
+
+| | cuDNN (SDPA) | FA4 | mem-efficient (SDPA) | KohakuFA | floor (correct kernel) | emulated: scale before shift |
+|---|---|---|---|---|---|---|
+| fp16 dQ | 1.0e-1 | 1.0e-1 | 5.7e-3 | 5.7e-3 | 5.5e-3 | 1.3e-1 |
+| fp16 dK | 5.4e-2 | 5.5e-2 | 2.2e-3 | 2.2e-3 | 2.1e-3 | 7.7e-2 |
+| bf16 dQ | **8.8e-1** | **8.7e-1** | 3.1e-2 | 3.1e-2 | 3.1e-2 | 1.1 |
+| bf16 dK | **5.0e-1** | **5.0e-1** | 9.5e-3 | 9.5e-3 | 9.3e-3 | 5.8e-1 |
+
+![pretrained DINOv3 ViT-B/16, per layer](docs/images/dinov3_b_layers.png)
+
+and it stays that way through fine-tuning (probed on the KohakuFA fp16 run's weights):
+
+![DINOv3 ViT-B/16, over training](docs/images/dinov3_b_training.png)
+
+* **FA4 and cuDNN fail the same way**: over the 21 probes, their worst layer is 2 to 26x above
+  the floor in fp16 and up to 54x in bf16, and the scale-before-shift emulation reproduces both
+  (bug 2 in [docs/precision.md](docs/precision.md)). KohakuFA stays within 0.7 to 1.2x of the
+  floor in both dtypes.
+* **bf16 does not help: it makes this bug 10x worse.** bf16 has fp32's range, but rounds the
+  row's largest probability (`2^residual` instead of exactly 1) to 8 bits instead of 11, so `O`
+  and the backward's `delta = rowsum(dO O)` are further off. Switching fp16 to bf16 hides
+  nothing here; it trades one kernel bug's symptom for a larger error.
+* The memory-efficient kernel is fine at these logits; its log-sum-exp bug (bug 1) needs logits
+  past ~1e6, see [the precision sweep](#precision). It and cuDNN have a fourth, fp16-only bug
+  (they round `scale * dS` instead of `dS`) that grows as fine-tuning shrinks the gradients at a
+  moderate loss scale: about 4x the floor on ViT-L/16 after 20k steps at 2^16
+  ([figure](docs/images/dinov3_l_training_scale2e16.png), bug 4 in
+  [docs/precision.md](docs/precision.md)).
+* On ViT-L/16 the sharpest layer is milder (logits up to 3.4e4) and so is the damage: FA4 and
+  cuDNN at 2 to 3x the floor in fp16, at the floor in bf16
+  ([per layer](docs/images/dinov3_l_layers.png), [over training](docs/images/dinov3_l_training.png)).
+* On this toy task the training loss is the same for every kernel and dtype
+  ([ViT-B runs](docs/images/dinov3_b_runs.png), [ViT-L runs](docs/images/dinov3_l_runs.png)):
+  20k steps of patch decoding are too easy for the wrong gradients to show in the loss. The
+  production run above is where they did, after the trunk's logits grew to 5e7.
+
 ## Install
 
 ```bash
@@ -290,7 +340,17 @@ python benchmarks/plot.py                              # -> docs/images
 
 FlashAttention-4 is benchmarked when `flash_attn.cute` is importable. The production-case
 figures come from summary CSVs in `benchmarks/results/production` (no weights or activations)
-and `benchmarks/plot_production.py`.
+and `benchmarks/plot_production.py`. The stock-DINOv3 study (needs `transformers` and access to
+the gated DINOv3 weights; any folder of natural images works as data):
+
+```bash
+python benchmarks/dinov3_backward.py --images <image folder> --model b --backend kohakufa --dtype fp16
+python benchmarks/dinov3_backward.py --images <image folder> --model l --backend kohakufa --dtype fp16 \
+    --fp16-scale 65536 --out benchmarks/results/dinov3_fixed16     # bug 4 at a fixed loss scale
+python benchmarks/plot_dinov3.py --runs benchmarks/results/dinov3   # -> docs/images/dinov3_*
+python benchmarks/plot_dinov3.py --runs benchmarks/results/dinov3_fixed16 \
+    --results benchmarks/results/dinov3_fixed16 --tag _scale2e16
+```
 
 ## License
 

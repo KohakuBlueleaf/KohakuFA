@@ -84,6 +84,50 @@ so only `dQ` shows it.
 **Fix:** the key tile that holds padded keys runs the masked path, with the padded keys
 invisible to every query; full tiles keep the unmasked fast path.
 
+## 4. Folding the softmax scale into dS before rounding it (fp16)
+
+The `dQ = scale * dS K` and `dK = scale * dS^T Q` matmuls take `dS` as a 16-bit tensor-core
+operand, so `dS` is rounded once in every kernel: that is the floor. Some kernels round
+`scale * dS` instead, applying the softmax scale first. In fp16 that costs `log2(1 / scale)`
+bits of range (3 bits at head dim 64): `dS` entries are already small (they carry
+`P (dP - delta)`, and `dO` carries the loss scale), and the extra factor pushes more of them
+below fp16's normal range (6e-5), where they lose precision or flush to zero.
+
+It depends on the loss scale, which is why it is easy to miss: with the scaler high
+(2^20 and up) the entries stay normal and every kernel is at the floor; at the scales a real
+fp16 run often settles at (2^14 to 2^17, capped by the largest gradient anywhere in the
+model) it is several times the floor, and it grows as fine-tuning shrinks the gradients. On
+pretrained DINOv3 ViT-L/16 fine-tuned with a fixed 2^16 loss scale
+(`benchmarks/dinov3_backward.py --fp16-scale 65536`), the worst layer's dK:
+
+![DINOv3 ViT-L/16 at loss scale 2^16](images/dinov3_l_training_scale2e16.png)
+
+cuDNN and the memory-efficient kernel leave the floor as training goes and reach about 4x it
+by 20k steps (median over layers: dQ 8.0e-3 against 2.1e-3, dK 1.3e-2 against 3.0e-3; worst
+layer dK 2.4e-2 against 7.8e-3); an fp64 emulation that rounds `scale * dS` to fp16 matches
+them to three digits. FA4 and KohakuFA round
+`dS` and apply the scale in fp32 afterwards, and stay on the floor.
+
+**Fix:** round `dS`, not `scale * dS`; apply the scale to the fp32 `dQ` / `dK` accumulators.
+
+## bf16 does not make these go away
+
+Bugs 1 to 3 come from fp32 arithmetic inside the kernel (the log-sum-exp, the exponent), not
+from the 16-bit operand format, so they hit bf16 exactly as they hit fp16. Bug 2 is *worse* in
+bf16: the row's largest `P` (`2^residual` instead of 1) is rounded to 8 bits instead of 11,
+so the error on `O`, and on `delta`, is 8x larger. On the pretrained DINOv3 ViT-B/16, before
+any training step (its first layer reaches logits of 1.4e5), the worst layer's dK relative
+error against fp64:
+
+| | cuDNN | FA4 | memory-efficient | KohakuFA | floor (correct kernel) |
+|---|---|---|---|---|---|
+| fp16 | 5.4e-2 | 5.5e-2 | 2.2e-3 | 2.2e-3 | 2.1e-3 |
+| bf16 | 5.0e-1 | 5.0e-1 | 9.5e-3 | 9.5e-3 | 9.3e-3 |
+
+Only bug 4 is fp16-specific (bf16 has fp32's exponent range, so `dS` does not underflow).
+Moving a run from fp16 to bf16 can hide that one, while making bug 2 larger; "fp16 is
+unstable, use bf16" mistakes a kernel bug for a number format.
+
 ## How it was found
 
 A video model fine-tuning a pretrained DINOv3 ViT in fp16 showed a creeping gradient
@@ -103,3 +147,9 @@ for the plots.
   error distributions).
 * `tests/test_attention.py::test_huge_logits` and `::test_padded_keys_with_all_negative_scores`:
   regression tests for bugs 1, 2 and 3.
+* `benchmarks/dinov3_backward.py`: fine-tunes the pretrained DINOv3 ViT-B/16 or ViT-L/16
+  from the Hugging Face Hub on a toy task and, every 1k steps, recomputes each layer's real
+  attention backward with cuDNN, the memory-efficient kernel, FA4 and KohakuFA, in fp16 and
+  bf16, against fp64, next to fp64 emulations of a correct kernel and of bugs 1, 2 and 4.
+  `benchmarks/plot_dinov3.py` reduces the logs to `benchmarks/results/dinov3*/summary.csv`
+  and draws the `docs/images/dinov3_*` figures.
