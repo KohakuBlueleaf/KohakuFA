@@ -26,14 +26,17 @@ fp64 (`benchmarks/dinov3_backward.py`). Worst layer's dK relative error, before 
 
 **Flex attention has the same bug, depending on sequence length.** A community member hit
 large-logit, wrong-gradient behaviour with PyTorch flex attention on an RTX PRO 6000 (cuDNN 9.10,
-logits above 3e5); we reproduced it on B300 (cuDNN 9.20). fp16 dQ relative error vs fp64, logits
+logits above 3e5); we reproduced it on B300 (cuDNN 9.20). dQ relative error vs fp64, logits
 ~1.2e5 (`torch.compile(flex_attention)`, dense):
 
 | sequence length | 256 | 261 | 1024 | 4096 |
 |---|---|---|---|---|
-| flex attention | **7.0e-2** | 4.8e-3 | **7.2e-2** | **5.9e-2** |
-| cuDNN (SDPA) | 7.1e-2 | 4.9e-2 | 7.2e-2 | 5.9e-2 |
-| **KohakuFA** | **5.5e-3** | **5.0e-3** | **5.9e-3** | **5.1e-3** |
+| fp16 flex attention | **7.0e-2** | 4.8e-3 | **7.2e-2** | **5.9e-2** |
+| fp16 cuDNN (SDPA) | 7.1e-2 | 4.9e-2 | 7.2e-2 | 5.9e-2 |
+| fp16 **KohakuFA** | **5.5e-3** | **5.0e-3** | **5.9e-3** | **5.1e-3** |
+| bf16 flex attention | **3.0** | 2.0e-2 | **7.3e-1** | **6.1e-1** |
+| bf16 cuDNN (SDPA) | 3.0 | 5.5e-1 | 7.3e-1 | 6.1e-1 |
+| bf16 **KohakuFA** | **1.4e-1** | **1.8e-2** | **3.5e-2** | **3.8e-2** |
 
 At lengths that are multiples of its block size flex matches cuDNN's error; at 261 (a ViT's 256
 patches plus 5 tokens, also DINOv3's length) it lands on a different, accurate path, likely a
