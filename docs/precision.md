@@ -4,9 +4,9 @@ Flash attention never stores the attention matrix `P`. The forward keeps a few n
 per query row, and the backward **recomputes** `P` from the scores and those numbers. When
 attention logits are ordinary (|logit| up to ~1e3) any reasonable bookkeeping works. When
 a layer learns near-one-hot attention, logits reach 1e5 to 1e8, and fp32 itself starts to
-run out of resolution: at |x| ~ 6e7 consecutive fp32 values are 4 apart. Three things then
-go wrong in common implementations, each silently, in the **backward** only (the forward
-output stays correct, so the loss looks fine).
+run out of resolution: at |x| ~ 6e7 consecutive fp32 values are 4 apart. Two things then
+go wrong in common implementations, and a third at any logit size in fp16, each silently, in
+the **backward** only (the forward output stays correct, so the loss looks fine).
 
 Notation: `S = q k^T` (raw scores), `c = scale * log2(e)`, `m` the row max, `l` the row
 sum, `P = exp2(c (S - m)) / l`, `delta = rowsum(dO * O)`, `dS = P * (dP - delta)`.
@@ -82,19 +82,7 @@ lose their difference. On the synthetic sweep (near-ties by design) its dQ / dK 
 from logits of 1e4 up (dQ 7.2e-2 at 1e5, against 5.9e-3 for KohakuFA; in bf16 0.73 against
 3.5e-2); on pretrained DINOv3's first layer it stays on the floor, where cuDNN and FA4 do not.
 
-## 3. Padded keys in the backward
-
-When `Skv` is not a multiple of the key tile, the last tile has zero-filled `K` / `V`
-rows. Their score is 0, and many kernels skip masking them in the backward ("zero `K`
-rows add nothing to `dQ`"). But their rebuilt `P` is `exp2(-c*m - log2 l)`, which
-overflows to `inf` for a query row whose real scores are all negative, and then
-`dQ += dS K` computes `inf * 0 = NaN`. `dK` / `dV` of those rows are dropped at the store,
-so only `dQ` shows it.
-
-**Fix:** the key tile that holds padded keys runs the masked path, with the padded keys
-invisible to every query; full tiles keep the unmasked fast path.
-
-## 4. Folding the softmax scale into dS before rounding it (fp16)
+## 3. Folding the softmax scale into dS before rounding it (fp16)
 
 The `dQ = scale * dS K` and `dK = scale * dS^T Q` matmuls take `dS` as a 16-bit tensor-core
 operand, so `dS` is rounded once in every kernel: that is the floor. Some kernels round
@@ -122,7 +110,7 @@ afterwards, and stay on the floor.
 
 ## bf16 does not make these go away
 
-Bugs 1 to 3 come from fp32 arithmetic inside the kernel (the log-sum-exp, the exponent), not
+Bugs 1 and 2 come from fp32 arithmetic inside the kernel (the log-sum-exp, the exponent), not
 from the 16-bit operand format, so they hit bf16 exactly as they hit fp16. Bug 2 is *worse* in
 bf16: the row's largest `P` (`2^residual` instead of 1) is rounded to 8 bits instead of 11,
 so the error on `O`, and on `delta`, is 8x larger. On the pretrained DINOv3 ViT-B/16, before
@@ -134,7 +122,7 @@ error against fp64:
 | fp16 | 5.4e-2 | 5.5e-2 | 2.2e-3 | 2.2e-3 | 2.1e-3 |
 | bf16 | 5.0e-1 | 5.0e-1 | 9.5e-3 | 9.5e-3 | 9.3e-3 |
 
-Only bug 4 is fp16-specific (bf16 has fp32's exponent range, so `dS` does not underflow).
+Only bug 3 is fp16-specific (bf16 has fp32's exponent range, so `dS` does not underflow).
 Moving a run from fp16 to bf16 can hide that one, while making bug 2 larger; "fp16 is
 unstable, use bf16" mistakes a kernel bug for a number format.
 
@@ -147,7 +135,7 @@ module in backward order, located the divergence inside the first trunk layer's
 attention backward: every layer above it matched to cosine 0.999. That layer's attention
 is near one-hot (pretrained DINOv3 already has logits ~1e5 there), and during training its
 logits grew to 5e7. An emulation of the kernel's arithmetic in torch, toggling one
-rounding at a time, isolated the three causes above. See the README's production case
+rounding at a time, isolated bugs 1 and 2 above. See the README's production case
 for the plots.
 
 A community member later hit the same large-logit, wrong-gradient behaviour with PyTorch flex
@@ -159,11 +147,10 @@ shares bug 1 and the milder form of bug 2 described above (synthetic sweep, `pre
 * `benchmarks/precision.py`: synthetic sweep of logit magnitude, every kernel against
   fp64 on the same fp16 inputs (relative error, max absolute error, cosine, per-row
   error distributions).
-* `tests/test_attention.py::test_huge_logits` and `::test_padded_keys_with_all_negative_scores`:
-  regression tests for bugs 1, 2 and 3.
+* `tests/test_attention.py::test_huge_logits`: regression test for bugs 1 and 2.
 * `benchmarks/dinov3_backward.py`: fine-tunes the pretrained DINOv3 ViT-B/16 or ViT-L/16
   from the Hugging Face Hub on a toy task and, every 1k steps, recomputes each layer's real
   attention backward with cuDNN, the memory-efficient kernel, FA4 and KohakuFA, in fp16 and
-  bf16, against fp64, next to fp64 emulations of a correct kernel and of bugs 1, 2 and 4.
+  bf16, against fp64, next to fp64 emulations of a correct kernel and of bugs 1, 2 and 3.
   `benchmarks/plot_dinov3.py` reduces the logs to `benchmarks/results/dinov3*/summary.csv`
   and draws the `docs/images/dinov3_*` figures.

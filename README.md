@@ -54,11 +54,10 @@ equal terms in exactly those rows. Notation: `S = q k^T`, `c = scale * log2(e)`,
 |---|---|---|---|---|
 | 1 | the row max and row sum are saved as **one** fp32 number, `c m + log2 l`; at large `c m` fp32 rounds `log2 l` away | the recomputed `P` no longer sums to 1: dV wrong directly, dQ / dK blow up | FA4, cuDNN, mem-efficient, flex | keep `m` and `log2 l` as two numbers |
 | 2 | the exponent is `fma(S, c, -c m)`, scale before shift: the row's largest `P` becomes `2^(rounding residual)` instead of exactly 1 | `O` carries that rounding error, so `delta = rowsum(dO O)` stops cancelling `dP`: dQ / dK wrong, **worse in bf16** | FA4, cuDNN; flex in a milder form (it scales every score before subtracting the max, so near-tied large logits lose their difference) | shift first, `(S - m) c`: exact near the max, the largest `P` is exactly 1 |
-| 3 | keys that pad a partial tile are left unmasked in the backward | their `P` overflows to `inf`, and `inf * 0 = NaN` lands in dQ | KohakuFA before the fix | the tile holding padded keys takes the masked path |
-| 4 | the softmax scale is folded into `dS` before it is rounded to fp16 | `log2(1 / scale)` bits of range lost to underflow (3 at head dim 64); grows as gradients shrink under a moderate loss scale | cuDNN, mem-efficient | round `dS`, apply the scale to the fp32 dQ / dK accumulators |
+| 3 | the softmax scale is folded into `dS` before it is rounded to fp16 | `log2(1 / scale)` bits of range lost to underflow (3 at head dim 64); grows as gradients shrink under a moderate loss scale | cuDNN, mem-efficient | round `dS`, apply the scale to the fp32 dQ / dK accumulators |
 
-Bugs 1 to 3 come from fp32 arithmetic inside the kernel, so they hit bf16 as hard as fp16 (bug 2
-harder); only bug 4 is fp16-specific. The fixes cost about 5% of attention time (one extra fp32
+Bugs 1 and 2 come from fp32 arithmetic inside the kernel, so they hit bf16 as hard as fp16 (bug 2
+harder); only bug 3 is fp16-specific. The fixes cost about 5% of attention time (one extra fp32
 operation per score). Full derivations, code and measurements: [docs/precision.md](docs/precision.md).
 
 ```python
@@ -78,10 +77,10 @@ out = attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal=True)
 
 ## Why this library
 
-* **Correct backward at large logits.** Four precision bugs common in flash-attention kernels
-  (a single fp32 log-sum-exp per row, scaling the scores before shifting them, unmasked padded
-  keys, rounding `scale * dS` instead of `dS` to fp16) are fixed here. They hit bf16 as well,
-  one of them harder; see [the precision results](#precision) and
+* **Correct backward at large logits.** Three precision bugs in FlashAttention-4, cuDNN, flex
+  attention and PyTorch's memory-efficient kernel (a single fp32 log-sum-exp per row, scaling the
+  scores before shifting them, rounding `scale * dS` instead of `dS` to fp16) are fixed here.
+  Two of them hit bf16 as well, one harder; see [the precision results](#precision) and
   [stock DINOv3](#on-stock-dinov3-from-the-hub-in-fp16-and-bf16).
 * **Block-causal attention as a first-class mode.** Video and streaming models attend causally
   over *frames*, not tokens. KohakuFA classifies every tile as hidden / fully visible / boundary,
@@ -122,9 +121,8 @@ backward, where it fell to 0.05. Its real activations, run through every kernel:
 ![production layer, every kernel vs fp64](docs/images/production_precision.png)
 
 From the pretrained weights on, cuDNN and FA4 are 10 to 20x worse than FA2 / KohakuFA on dQ / dK;
-past 4e6 they fail outright (relative error > 1), and the pre-fix KohakuFA returned `dQ = inf`
-on the pretrained weights (the padded-key bug). For the whole model, one training step's gradient
-against fp64:
+past 4e6 they fail outright (relative error > 1). For the whole model, one training step's
+gradient against fp64:
 
 ![whole-model gradient vs fp64](docs/images/production_model_gradients.png)
 
@@ -171,10 +169,10 @@ the over-training figure is [at the top](#kohakufa)):
   and the backward's `delta = rowsum(dO O)` are further off. Switching fp16 to bf16 hides
   nothing here; it trades one kernel bug's symptom for a larger error.
 * The memory-efficient kernel is fine at these logits; its log-sum-exp bug (bug 1) needs logits
-  past ~1e6, see [the synthetic sweep](#synthetic-sweep-where-each-kernel-breaks). It and cuDNN have a fourth, fp16-only bug
+  past ~1e6, see [the synthetic sweep](#synthetic-sweep-where-each-kernel-breaks). It and cuDNN have a third, fp16-only bug
   (they round `scale * dS` instead of `dS`) that grows as fine-tuning shrinks the gradients at a
   moderate loss scale: 4 to 6x the floor on ViT-L/16 after 20k steps at 2^16
-  ([figure](docs/images/dinov3_l_training_scale2e16.png), bug 4 in
+  ([figure](docs/images/dinov3_l_training_scale2e16.png), bug 3 in
   [docs/precision.md](docs/precision.md)).
 * On ViT-L/16 the sharpest layer is milder (logits up to 3.4e4) and so is the damage: FA4 and
   cuDNN at 2 to 3x the floor in fp16, at the floor in bf16
@@ -398,7 +396,7 @@ the gated DINOv3 weights; any folder of natural images works as data):
 ```bash
 python benchmarks/dinov3_backward.py --images <image folder> --model b --backend kohakufa --dtype fp16
 python benchmarks/dinov3_backward.py --images <image folder> --model l --backend kohakufa --dtype fp16 \
-    --fp16-scale 65536 --out benchmarks/results/dinov3_fixed16     # bug 4 at a fixed loss scale
+    --fp16-scale 65536 --out benchmarks/results/dinov3_fixed16     # bug 3 at a fixed loss scale
 python benchmarks/plot_dinov3.py --runs benchmarks/results/dinov3   # -> docs/images/dinov3_*
 python benchmarks/plot_dinov3.py --runs benchmarks/results/dinov3_fixed16 \
     --results benchmarks/results/dinov3_fixed16 --tag _scale2e16
