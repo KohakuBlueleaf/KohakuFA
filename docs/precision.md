@@ -80,7 +80,9 @@ subtracts the max of the *scaled* scores. The row's largest `P` is still exactly
 score is rounded at its scaled magnitude before the shift, so near-tied keys with large logits
 lose their difference. On the synthetic sweep (near-ties by design) its dQ / dK track cuDNN's
 from logits of 1e4 up (dQ 7.2e-2 at 1e5, against 5.9e-3 for KohakuFA; in bf16 0.73 against
-3.5e-2); on pretrained DINOv3's first layer it stays on the floor, where cuDNN and FA4 do not.
+3.5e-2). The error depends on the sequence length: at multiples of its block size (256, 1024,
+4096) flex matches cuDNN, at 261 (DINOv3's length) it is accurate, likely a different kernel or
+block selection for unaligned lengths.
 
 ## 3. Folding the softmax scale into dS before rounding it (fp16)
 

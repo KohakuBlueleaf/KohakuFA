@@ -19,10 +19,26 @@ fault, it was the attention kernel's.** The details are in [docs/precision.md](d
 Face Hub on a toy task and recompute each layer's attention backward with every kernel against
 fp64 (`benchmarks/dinov3_backward.py`). Worst layer's dK relative error, before any training step:
 
-| | cuDNN (PyTorch SDPA) | FlashAttention-4 | flex attention | **KohakuFA** | correct-kernel floor |
-|---|---|---|---|---|---|
-| fp16 | 5.4e-2 (25x floor) | 5.5e-2 (26x) | 2.2e-3 (1.0x) | **2.2e-3 (1.0x)** | 2.1e-3 |
-| bf16 | 5.0e-1 (54x floor) | 5.0e-1 (54x) | 9.4e-3 (1.0x) | **9.5e-3 (1.0x)** | 9.3e-3 |
+| | cuDNN (PyTorch SDPA) | FlashAttention-4 | **KohakuFA** | correct-kernel floor |
+|---|---|---|---|---|
+| fp16 | 5.4e-2 (25x floor) | 5.5e-2 (26x) | **2.2e-3 (1.0x)** | 2.1e-3 |
+| bf16 | 5.0e-1 (54x floor) | 5.0e-1 (54x) | **9.5e-3 (1.0x)** | 9.3e-3 |
+
+**Flex attention has the same bug, depending on sequence length.** A community member hit
+large-logit, wrong-gradient behaviour with PyTorch flex attention on an RTX PRO 6000 (cuDNN 9.10,
+logits above 3e5); we reproduced it on B300 (cuDNN 9.20). fp16 dQ relative error vs fp64, logits
+~1.2e5 (`torch.compile(flex_attention)`, dense):
+
+| sequence length | 256 | 261 | 1024 | 4096 |
+|---|---|---|---|---|
+| flex attention | **7.0e-2** | 4.8e-3 | **7.2e-2** | **5.9e-2** |
+| cuDNN (SDPA) | 7.1e-2 | 4.9e-2 | 7.2e-2 | 5.9e-2 |
+| **KohakuFA** | **5.5e-3** | **5.0e-3** | **5.9e-3** | **5.1e-3** |
+
+At lengths that are multiples of its block size flex matches cuDNN's error; at 261 (a ViT's 256
+patches plus 5 tokens, also DINOv3's length) it lands on a different, accurate path, likely a
+different kernel or block selection for unaligned lengths. Causal and key-padding masks show the
+same pattern (S=1024 causal: flex 8.5e-2). KohakuFA is accurate at every length.
 
 and through 20k fine-tuning steps, in fp16 and bf16 (bf16 does not hide the bug; it makes it
 larger):
@@ -31,12 +47,6 @@ larger):
 
 In a real fp16 video-model run these bugs decorrelated the trunk's gradients from the truth
 (cosine 0.01) and made the gradient norm creep up 10x; see [Precision](#precision).
-
-Flex attention is fine on this layer but not at larger logits: a community member hit the same
-large-logit, wrong-gradient behaviour with PyTorch flex attention on an RTX PRO 6000 (cuDNN 9.10),
-and we reproduced it on B300 (cuDNN 9.20). On the synthetic sweep below, flex's gradient errors
-match cuDNN's from logits of 1e4 up (dQ 7.2e-2 at 1e5 against KohakuFA's 5.9e-3; dV 0.21 at
-1e7 against 2e-4).
 
 ### Why the gradients go wrong, and how KohakuFA fixes it
 
@@ -149,12 +159,12 @@ the error.
 1.4e5) already breaks FA4 and cuDNN, in both dtypes (relative L2 error vs fp64, worst layer;
 the over-training figure is [at the top](#kohakufa)):
 
-| | cuDNN (SDPA) | FA4 | mem-efficient (SDPA) | flex | KohakuFA | floor (correct kernel) | emulated: scale before shift |
-|---|---|---|---|---|---|---|---|
-| fp16 dQ | 1.0e-1 | 1.0e-1 | 5.7e-3 | 5.7e-3 | 5.7e-3 | 5.5e-3 | 1.3e-1 |
-| fp16 dK | 5.4e-2 | 5.5e-2 | 2.2e-3 | 2.2e-3 | 2.2e-3 | 2.1e-3 | 7.7e-2 |
-| bf16 dQ | **8.8e-1** | **8.7e-1** | 3.1e-2 | 3.1e-2 | 3.1e-2 | 3.1e-2 | 1.1 |
-| bf16 dK | **5.0e-1** | **5.0e-1** | 9.5e-3 | 9.4e-3 | 9.5e-3 | 9.3e-3 | 5.8e-1 |
+| | cuDNN (SDPA) | FA4 | mem-efficient (SDPA) | KohakuFA | floor (correct kernel) | emulated: scale before shift |
+|---|---|---|---|---|---|---|
+| fp16 dQ | 1.0e-1 | 1.0e-1 | 5.7e-3 | 5.7e-3 | 5.5e-3 | 1.3e-1 |
+| fp16 dK | 5.4e-2 | 5.5e-2 | 2.2e-3 | 2.2e-3 | 2.1e-3 | 7.7e-2 |
+| bf16 dQ | **8.8e-1** | **8.7e-1** | 3.1e-2 | 3.1e-2 | 3.1e-2 | 1.1 |
+| bf16 dK | **5.0e-1** | **5.0e-1** | 9.5e-3 | 9.5e-3 | 9.3e-3 | 5.8e-1 |
 
 ![pretrained DINOv3 ViT-B/16, per layer](docs/images/dinov3_b_layers.png)
 
