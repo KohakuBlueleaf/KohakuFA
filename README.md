@@ -15,6 +15,23 @@ gradients stay at the fp16 rounding floor there, as close to fp64 as FlashAttent
 The short version of what this repository found: **"fp16 training is unstable" was not fp16's
 fault, it was the attention kernel's.** The details are in [docs/precision.md](docs/precision.md).
 
+**You can check it on a stock model.** Fine-tune the pretrained DINOv3 ViT-B/16 from the Hugging
+Face Hub on a toy task and recompute each layer's attention backward with every kernel against
+fp64 (`benchmarks/dinov3_backward.py`). Worst layer's dK relative error, before any training step:
+
+| | cuDNN (PyTorch SDPA) | FlashAttention-4 | **KohakuFA** | correct-kernel floor |
+|---|---|---|---|---|
+| fp16 | 5.4e-2 (25x floor) | 5.5e-2 (26x) | **2.2e-3 (1.0x)** | 2.1e-3 |
+| bf16 | 5.0e-1 (54x floor) | 5.0e-1 (54x) | **9.5e-3 (1.0x)** | 9.3e-3 |
+
+and through 20k fine-tuning steps, in fp16 and bf16 (bf16 does not hide the bug; it makes it
+larger):
+
+![DINOv3 ViT-B/16, attention backward error over training](docs/images/dinov3_b_training.png)
+
+In a real fp16 video-model run these bugs decorrelated the trunk's gradients from the truth
+(cosine 0.01) and made the gradient norm creep up 10x; see [Precision](#precision).
+
 ```python
 from kohakufa import attention, attention_varlen, pack_mask
 
@@ -36,7 +53,7 @@ out = attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal=True)
   (a single fp32 log-sum-exp per row, scaling the scores before shifting them, unmasked padded
   keys, rounding `scale * dS` instead of `dS` to fp16) are fixed here. They hit bf16 as well,
   one of them harder; see [the precision results](#precision) and
-  [stock DINOv3](#reproduce-it-on-stock-dinov3-in-fp16-and-bf16).
+  [stock DINOv3](#on-stock-dinov3-from-the-hub-in-fp16-and-bf16).
 * **Block-causal attention as a first-class mode.** Video and streaming models attend causally
   over *frames*, not tokens. KohakuFA classifies every tile as hidden / fully visible / boundary,
   never loads hidden tiles, and only masks boundary tiles: up to **4.7x** faster than
@@ -53,6 +70,90 @@ out = attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal=True)
   synchronization and numerics documented in place.
 
 ## Precision
+
+First what it does to real training, then the mechanics. Every measurement compares a
+kernel's gradient against fp64 on the same rounded inputs, so any difference is the
+kernel's own error; [docs/precision.md](docs/precision.md) explains each bug.
+
+### In a real training run: how the bugs were found
+
+KohakuFA started inside a video-representation project that fine-tunes a pretrained **DINOv3**
+ViT (no QK-norm) with a diffusion decoder, in fp16 on B300s with PyTorch SDPA (cuDNN) attention.
+The run's loss looked normal, but in its second half the gradient norm crept up 10x and the fp16
+loss scale kept collapsing:
+
+![production run symptom and cause](docs/images/production_training.png)
+
+The first trunk layer's attention is a near-one-hot lookup already in the pretrained model
+(logits ~1e5, 90% of rows over 99% on one key), and during training its q / k grew until the
+logits reached 5e7. Comparing fp16 gradients with fp64 on the same weights and batch, module by
+module in backward order, everything matched to cosine 0.999 down to that layer's attention
+backward, where it fell to 0.05. Its real activations, run through every kernel:
+
+![production layer, every kernel vs fp64](docs/images/production_precision.png)
+
+From the pretrained weights on, cuDNN and FA4 are 10 to 20x worse than FA2 / KohakuFA on dQ / dK;
+past 4e6 they fail outright (relative error > 1), and the pre-fix KohakuFA returned `dQ = inf`
+on the pretrained weights (the padded-key bug). For the whole model, one training step's gradient
+against fp64:
+
+![whole-model gradient vs fp64](docs/images/production_model_gradients.png)
+
+With cuDNN attention the embeddings' and trunk norms' gradients decorrelate from the truth
+(cosine 0.01 at 200k, 34x too large); with KohakuFA they stay at the same agreement as at 50k.
+Clipping then scaled *every* gradient by the inflated norm, and Adam turned the noise into
+full-size steps on the very weights whose growth made it worse.
+
+At the run's own attention call sites (effective TFLOPS, fwd and fwd+bwd):
+
+![production call sites](docs/images/production_speed.png)
+
+### On stock DINOv3 from the Hub, in fp16 and bf16
+
+The production run is not a special setup. `benchmarks/dinov3_backward.py` takes the
+**pretrained DINOv3 ViT-B/16 and ViT-L/16 from the Hugging Face Hub**, fine-tunes them on a toy
+task (decode each patch token back to its RGB patch, 20k steps), and every 1k steps runs each
+layer's real attention inputs through every kernel, against fp64 on the same rounded inputs:
+fp16 with the run's live loss scale, and bf16 with none. Next to the kernels, fp64 emulations of
+a correct kernel ("floor") and of each bug in [docs/precision.md](docs/precision.md) attribute
+the error.
+
+**Before a single training step**, the pretrained ViT-B/16's first attention layer (logits up to
+1.4e5) already breaks FA4 and cuDNN, in both dtypes (relative L2 error vs fp64, worst layer;
+the over-training figure is [at the top](#kohakufa)):
+
+| | cuDNN (SDPA) | FA4 | mem-efficient (SDPA) | KohakuFA | floor (correct kernel) | emulated: scale before shift |
+|---|---|---|---|---|---|---|
+| fp16 dQ | 1.0e-1 | 1.0e-1 | 5.7e-3 | 5.7e-3 | 5.5e-3 | 1.3e-1 |
+| fp16 dK | 5.4e-2 | 5.5e-2 | 2.2e-3 | 2.2e-3 | 2.1e-3 | 7.7e-2 |
+| bf16 dQ | **8.8e-1** | **8.7e-1** | 3.1e-2 | 3.1e-2 | 3.1e-2 | 1.1 |
+| bf16 dK | **5.0e-1** | **5.0e-1** | 9.5e-3 | 9.5e-3 | 9.3e-3 | 5.8e-1 |
+
+![pretrained DINOv3 ViT-B/16, per layer](docs/images/dinov3_b_layers.png)
+
+* **FA4 and cuDNN fail the same way**: over the 21 probes, their worst layer is 2 to 26x above
+  the floor in fp16 and up to 54x in bf16, and the scale-before-shift emulation reproduces both
+  (bug 2 in [docs/precision.md](docs/precision.md)). KohakuFA stays within 0.7 to 1.2x of the
+  floor in both dtypes.
+* **bf16 does not help: it makes this bug 10x worse.** bf16 has fp32's range, but rounds the
+  row's largest probability (`2^residual` instead of exactly 1) to 8 bits instead of 11, so `O`
+  and the backward's `delta = rowsum(dO O)` are further off. Switching fp16 to bf16 hides
+  nothing here; it trades one kernel bug's symptom for a larger error.
+* The memory-efficient kernel is fine at these logits; its log-sum-exp bug (bug 1) needs logits
+  past ~1e6, see [the synthetic sweep](#synthetic-sweep-where-each-kernel-breaks). It and cuDNN have a fourth, fp16-only bug
+  (they round `scale * dS` instead of `dS`) that grows as fine-tuning shrinks the gradients at a
+  moderate loss scale: about 4x the floor on ViT-L/16 after 20k steps at 2^16
+  ([figure](docs/images/dinov3_l_training_scale2e16.png), bug 4 in
+  [docs/precision.md](docs/precision.md)).
+* On ViT-L/16 the sharpest layer is milder (logits up to 3.4e4) and so is the damage: FA4 and
+  cuDNN at 2 to 3x the floor in fp16, at the floor in bf16
+  ([per layer](docs/images/dinov3_l_layers.png), [over training](docs/images/dinov3_l_training.png)).
+* On this toy task the training loss is the same for every kernel and dtype
+  ([ViT-B runs](docs/images/dinov3_b_runs.png), [ViT-L runs](docs/images/dinov3_l_runs.png)):
+  20k steps of patch decoding are too easy for the wrong gradients to show in the loss. The
+  production run above is where they did, after the trunk's logits grew to 5e7.
+
+### Synthetic sweep: where each kernel breaks
 
 Every kernel against **fp64 math on the same fp16 inputs**, so any difference is the kernel's
 own error. Inputs are synthetic and seeded (`benchmarks/precision.py`): queries and keys around a
@@ -207,87 +308,6 @@ Where KohakuFA is measurably slower than the fastest of FlashAttention-4 and cuD
   slice (7 instead of 5 matrix products at D = 256, 11 at D = 512).
 
 Details and the measurements behind each: [docs/performance-notes.md](docs/performance-notes.md).
-
-## Production case: how the bugs were found
-
-KohakuFA started inside a video-representation project that fine-tunes a pretrained **DINOv3**
-ViT (no QK-norm) with a diffusion decoder, in fp16 on B300s with PyTorch SDPA (cuDNN) attention.
-The run's loss looked normal, but in its second half the gradient norm crept up 10x and the fp16
-loss scale kept collapsing:
-
-![production run symptom and cause](docs/images/production_training.png)
-
-The first trunk layer's attention is a near-one-hot lookup already in the pretrained model
-(logits ~1e5, 90% of rows over 99% on one key), and during training its q / k grew until the
-logits reached 5e7. Comparing fp16 gradients with fp64 on the same weights and batch, module by
-module in backward order, everything matched to cosine 0.999 down to that layer's attention
-backward, where it fell to 0.05. Its real activations, run through every kernel:
-
-![production layer, every kernel vs fp64](docs/images/production_precision.png)
-
-From the pretrained weights on, cuDNN and FA4 are 10 to 20x worse than FA2 / KohakuFA on dQ / dK;
-past 4e6 they fail outright (relative error > 1), and the pre-fix KohakuFA returned `dQ = inf`
-on the pretrained weights (the padded-key bug). For the whole model, one training step's gradient
-against fp64:
-
-![whole-model gradient vs fp64](docs/images/production_model_gradients.png)
-
-With cuDNN attention the embeddings' and trunk norms' gradients decorrelate from the truth
-(cosine 0.01 at 200k, 34x too large); with KohakuFA they stay at the same agreement as at 50k.
-Clipping then scaled *every* gradient by the inflated norm, and Adam turned the noise into
-full-size steps on the very weights whose growth made it worse.
-
-At the run's own attention call sites (effective TFLOPS, fwd and fwd+bwd):
-
-![production call sites](docs/images/production_speed.png)
-
-## Reproduce it on stock DINOv3, in fp16 and bf16
-
-The production run is not a special setup. `benchmarks/dinov3_backward.py` takes the
-**pretrained DINOv3 ViT-B/16 and ViT-L/16 from the Hugging Face Hub**, fine-tunes them on a toy
-task (decode each patch token back to its RGB patch, 20k steps), and every 1k steps runs each
-layer's real attention inputs through every kernel, against fp64 on the same rounded inputs:
-fp16 with the run's live loss scale, and bf16 with none. Next to the kernels, fp64 emulations of
-a correct kernel ("floor") and of each bug in [docs/precision.md](docs/precision.md) attribute
-the error.
-
-**Before a single training step**, the pretrained ViT-B/16's first attention layer (logits up to
-1.4e5) already breaks FA4 and cuDNN, in both dtypes (relative L2 error vs fp64, worst layer):
-
-| | cuDNN (SDPA) | FA4 | mem-efficient (SDPA) | KohakuFA | floor (correct kernel) | emulated: scale before shift |
-|---|---|---|---|---|---|---|
-| fp16 dQ | 1.0e-1 | 1.0e-1 | 5.7e-3 | 5.7e-3 | 5.5e-3 | 1.3e-1 |
-| fp16 dK | 5.4e-2 | 5.5e-2 | 2.2e-3 | 2.2e-3 | 2.1e-3 | 7.7e-2 |
-| bf16 dQ | **8.8e-1** | **8.7e-1** | 3.1e-2 | 3.1e-2 | 3.1e-2 | 1.1 |
-| bf16 dK | **5.0e-1** | **5.0e-1** | 9.5e-3 | 9.5e-3 | 9.3e-3 | 5.8e-1 |
-
-![pretrained DINOv3 ViT-B/16, per layer](docs/images/dinov3_b_layers.png)
-
-and it stays that way through fine-tuning (probed on the KohakuFA fp16 run's weights):
-
-![DINOv3 ViT-B/16, over training](docs/images/dinov3_b_training.png)
-
-* **FA4 and cuDNN fail the same way**: over the 21 probes, their worst layer is 2 to 26x above
-  the floor in fp16 and up to 54x in bf16, and the scale-before-shift emulation reproduces both
-  (bug 2 in [docs/precision.md](docs/precision.md)). KohakuFA stays within 0.7 to 1.2x of the
-  floor in both dtypes.
-* **bf16 does not help: it makes this bug 10x worse.** bf16 has fp32's range, but rounds the
-  row's largest probability (`2^residual` instead of exactly 1) to 8 bits instead of 11, so `O`
-  and the backward's `delta = rowsum(dO O)` are further off. Switching fp16 to bf16 hides
-  nothing here; it trades one kernel bug's symptom for a larger error.
-* The memory-efficient kernel is fine at these logits; its log-sum-exp bug (bug 1) needs logits
-  past ~1e6, see [the precision sweep](#precision). It and cuDNN have a fourth, fp16-only bug
-  (they round `scale * dS` instead of `dS`) that grows as fine-tuning shrinks the gradients at a
-  moderate loss scale: about 4x the floor on ViT-L/16 after 20k steps at 2^16
-  ([figure](docs/images/dinov3_l_training_scale2e16.png), bug 4 in
-  [docs/precision.md](docs/precision.md)).
-* On ViT-L/16 the sharpest layer is milder (logits up to 3.4e4) and so is the damage: FA4 and
-  cuDNN at 2 to 3x the floor in fp16, at the floor in bf16
-  ([per layer](docs/images/dinov3_l_layers.png), [over training](docs/images/dinov3_l_training.png)).
-* On this toy task the training loss is the same for every kernel and dtype
-  ([ViT-B runs](docs/images/dinov3_b_runs.png), [ViT-L runs](docs/images/dinov3_l_runs.png)):
-  20k steps of patch decoding are too easy for the wrong gradients to show in the loss. The
-  production run above is where they did, after the trunk's logits grew to 5e7.
 
 ## Install
 
