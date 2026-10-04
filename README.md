@@ -60,15 +60,24 @@ near-one-hot attention in some layers (DINOv3's first layers reach logits of 1e5
 and training pushes them higher), and at those magnitudes fp32 has few bits left after the
 decimal point, so *how* those per-row numbers are kept and combined decides whether the
 recomputed `P` is right. A slip there is invisible in the forward (the output and the loss look
-fine) but is amplified in the backward, whose `dS = P (dP - delta)` is a difference of nearly
-equal terms in exactly those rows. Notation: `S = q k^T`, `c = scale * log2(e)`, `m` the row max,
-`l` the row sum.
+fine) but is amplified in the backward, whose `dS = P * (dP - delta)` is a difference of nearly
+equal terms in exactly those rows.
+
+Notation, per query row (`*` is elementwise or scalar multiplication, `@` a matrix product,
+`log2` / `exp2` are functions):
+
+* `S = Q @ K^T`: the raw scores; `scale = 1 / sqrt(D)`; `c = scale * log2(e)`, so the
+  softmax is computed with `exp2`
+* `m = max(S)`: the row max; `l = sum(exp2(c * (S - m)))`: the row sum
+* `P = exp2(c * (S - m)) / l`, `O = P @ V`
+* backward: `dP = dO @ V^T`, `delta = rowsum(dO * O)`, `dS = P * (dP - delta)`,
+  `dQ = scale * (dS @ K)`, `dK = scale * (dS^T @ Q)`, `dV = P^T @ dO`
 
 | | what goes wrong | effect | seen in | KohakuFA's fix |
 |---|---|---|---|---|
-| 1 | the row max and row sum are saved as **one** fp32 number, `c m + log2 l`; at large `c m` fp32 rounds `log2 l` away | the recomputed `P` no longer sums to 1: dV wrong directly, dQ / dK blow up | FA4, cuDNN, mem-efficient, flex | keep `m` and `log2 l` as two numbers |
-| 2 | the exponent is `fma(S, c, -c m)`, scale before shift: the row's largest `P` becomes `2^(rounding residual)` instead of exactly 1 | `O` carries that rounding error, so `delta = rowsum(dO O)` stops cancelling `dP`: dQ / dK wrong, **worse in bf16** | FA4, cuDNN; flex in a milder form (it scales every score before subtracting the max, so near-tied large logits lose their difference) | shift first, `(S - m) c`: exact near the max, the largest `P` is exactly 1 |
-| 3 | the softmax scale is folded into `dS` before it is rounded to fp16 | `log2(1 / scale)` bits of range lost to underflow (3 at head dim 64); grows as gradients shrink under a moderate loss scale | cuDNN, mem-efficient | round `dS`, apply the scale to the fp32 dQ / dK accumulators |
+| 1 | the row max and row sum are saved as **one** fp32 number, `lse = c * m + log2(l)`; at large `c * m`, fp32 rounds `log2(l)` away | the recomputed `P = exp2(c * S - lse)` no longer sums to 1: dV wrong directly, dQ / dK blow up | FA4, cuDNN, mem-efficient, flex | keep `m` and `log2(l)` as two numbers: `P = exp2(c * (S - m) - log2(l))` |
+| 2 | the exponent is `fma(S, c, -(c * m))` = `S * c - c * m`, scale before shift: `c * m` is rounded to fp32, so the row's largest `P` is `2^(rounding residual)` instead of exactly 1 | `O` carries that rounding error, so `delta = rowsum(dO * O)` stops cancelling `dP`: dQ / dK wrong, **worse in bf16** | FA4, cuDNN; flex in a milder form (it computes `S * c` for every score before subtracting the max, so near-tied large logits lose their difference) | shift first, `(S - m) * c`: `S - m` is exact near the max, the largest `P` is exactly 1 |
+| 3 | `scale * dS` is rounded to fp16 (the operand of the dQ / dK matmuls) instead of `dS` | `log2(1 / scale)` bits of range lost to underflow (3 at head dim 64); grows as gradients shrink under a moderate loss scale | cuDNN, mem-efficient | round `dS` to fp16; multiply by `scale` on the fp32 dQ / dK accumulators |
 
 Bugs 1 and 2 come from fp32 arithmetic inside the kernel, so they hit bf16 as hard as fp16 (bug 2
 harder); only bug 3 is fp16-specific. The fixes cost about 5% of attention time (one extra fp32
@@ -180,7 +189,7 @@ the over-training figure is [at the top](#kohakufa)):
   leaves out, not a bug).
 * **bf16 does not help: it makes this bug 10x worse.** bf16 has fp32's range, but rounds the
   row's largest probability (`2^residual` instead of exactly 1) to 8 bits instead of 11, so `O`
-  and the backward's `delta = rowsum(dO O)` are further off. Switching fp16 to bf16 hides
+  and the backward's `delta = rowsum(dO * O)` are further off. Switching fp16 to bf16 hides
   nothing here; it trades one kernel bug's symptom for a larger error.
 * The memory-efficient kernel is fine at these logits; its log-sum-exp bug (bug 1) needs logits
   past ~1e6, see [the synthetic sweep](#synthetic-sweep-where-each-kernel-breaks). It and cuDNN have a third, fp16-only bug

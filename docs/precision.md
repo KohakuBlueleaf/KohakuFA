@@ -8,8 +8,11 @@ run out of resolution: at |x| ~ 6e7 consecutive fp32 values are 4 apart. Two thi
 go wrong in common implementations, and a third at any logit size in fp16, each silently, in
 the **backward** only (the forward output stays correct, so the loss looks fine).
 
-Notation: `S = q k^T` (raw scores), `c = scale * log2(e)`, `m` the row max, `l` the row
-sum, `P = exp2(c (S - m)) / l`, `delta = rowsum(dO * O)`, `dS = P * (dP - delta)`.
+Notation, per query row (`*` is elementwise or scalar multiplication, `@` a matrix product,
+`log2` / `exp2` are functions): `S = Q @ K^T` (raw scores), `scale = 1 / sqrt(D)`,
+`c = scale * log2(e)`, `m = max(S)` the row max, `l = sum(exp2(c * (S - m)))` the row sum,
+`P = exp2(c * (S - m)) / l`, `O = P @ V`, `dP = dO @ V^T`, `delta = rowsum(dO * O)`,
+`dS = P * (dP - delta)`, `dQ = scale * (dS @ K)`, `dK = scale * (dS^T @ Q)`, `dV = P^T @ dO`.
 
 ## 1. One fp32 log-sum-exp per row
 
@@ -18,14 +21,14 @@ rebuilds `P = exp2(c*S - lse)`.
 
 With `c*m ~ 6e7`, fp32 steps by 4, and `log2(l)` (between 0 and log2 of the key count,
 so at most ~8 here) is mostly rounded away. The rebuilt `P` no longer sums to one: it is
-off by up to `2^+-2` per row. `dV = P^T dO` is wrong directly, and `dS = P (dP - delta)`
+off by up to `2^+-2` per row. `dV = P^T @ dO` is wrong directly, and `dS = P * (dP - delta)`
 stops cancelling, so `dQ` and `dK` blow up.
 
 **Fix:** keep the two apart. The forward stores `m` (raw score units) and `log2(l)` as two
 fp32 planes (`lse` is `[B, H, 2, Sq]`), and the backward rebuilds
 
 ```python
-# sm100/bwd.py, P warpgroup: P^T = exp2(c (S^T - m) - log2 l)
+# sm100/bwd.py, P warpgroup: P^T = exp2(c * (S^T - m) - log2(l))
 x2 = float2.fma(s2 + m2, scale2, log_l2)  # m2 = -m, log_l2 = -log2(l)
 prob = gl.exp2(float2.unpack(x2, axis=1))
 ```
@@ -59,7 +62,7 @@ dominates and `dQ`, `dK` are wrong.
 # sm100/fwd.py, softmax step: m is the max of the raw scores
 m_new = gl.maximum(m_i, row_max)
 alpha = gl.exp2((m_i - m_new) * p.qk_scale)          # rescale of O and l
-x2 = (float2.pack(chunks[c], axis=1) + neg_m2) * scale2  # (S - m) * c, not fma(S, c, -c m)
+x2 = (float2.pack(chunks[c], axis=1) + neg_m2) * scale2  # (S - m) * c, not fma(S, c, -c * m)
 prob = gl.exp2(float2.unpack(x2, axis=1))
 ```
 
@@ -86,11 +89,11 @@ accurate, so the bug is in the path it selects for divisible lengths (`IS_DIVISI
 
 ## 3. Folding the softmax scale into dS before rounding it (fp16)
 
-The `dQ = scale * dS K` and `dK = scale * dS^T Q` matmuls take `dS` as a 16-bit tensor-core
+The `dQ = scale * (dS @ K)` and `dK = scale * (dS^T @ Q)` matmuls take `dS` as a 16-bit tensor-core
 operand, so `dS` is rounded once in every kernel: that is the floor. Some kernels round
 `scale * dS` instead, applying the softmax scale first. In fp16 that costs `log2(1 / scale)`
 bits of range (3 bits at head dim 64): `dS` entries are already small (they carry
-`P (dP - delta)`, and `dO` carries the loss scale), and the extra factor pushes more of them
+`P * (dP - delta)`, and `dO` carries the loss scale), and the extra factor pushes more of them
 below fp16's normal range (6e-5), where they lose precision or flush to zero.
 
 It depends on the loss scale, which is why it is easy to miss: with the scaler high
