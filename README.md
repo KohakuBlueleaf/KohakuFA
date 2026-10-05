@@ -224,8 +224,15 @@ and some keys nearly tie, like an attention layer that learned a lookup.
   ([precision_rel_err](docs/images/precision_rel_err.png)).
 * The same sweep with max absolute error and with `1 - cosine` is in
   [precision_max_abs_err](docs/images/precision_max_abs_err_j3e-2.png) and
-  [precision_one_minus_cos](docs/images/precision_one_minus_cos_j3e-2.png); per-row error
-  distributions in [precision_rows](docs/images/precision_rows_j3e-2.png).
+  [precision_one_minus_cos](docs/images/precision_one_minus_cos_j3e-2.png).
+
+Per-row error, the same sweep at three logit scales (query rows for dQ, key rows for dK / dV):
+
+![per-row relative error, violins](docs/images/precision_rows_j3e-2.png)
+
+At 1e7 every dV row of KohakuFA and FA2 stays near the fp16 floor (~1e-3.5), while FA4,
+cuDNN and flex put whole rows at relative error ~1 and their dQ / dK row medians at 1e2.5 to
+1e3; KohakuFA's dQ rows stay below ~5.
 
 ## Speed
 
