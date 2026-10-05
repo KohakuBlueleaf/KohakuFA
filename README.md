@@ -375,7 +375,8 @@ black), `.[bench]` (matplotlib, numpy for the benchmark plots).
 ## Usage
 
 ```python
-attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=None)
+attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=None,
+          center_keys=False)
 ```
 
 * `q`: `[B, H, Sq, D]`, `k` / `v`: `[B, H, Skv, D]`. Views of `[B, S, H, D]` projections work
@@ -385,6 +386,10 @@ attention(q, k, v, *, causal=False, block_causal=0, scale=None, compute_dtype=No
   zero gradient). Same as `block_causal=1`.
 * `block_causal=P`: query `r` sees the keys of frames `0..r // P`.
 * `compute_dtype`: tensor-core operand dtype; other input dtypes (e.g. fp32) are cast.
+* `center_keys`: subtract the mean key (per batch and K / V head, in fp32; per sequence in
+  `attention_varlen`) before the single cast to `compute_dtype` (key smoothing, as in SageBwd).
+  Exact: every logit of a row moves by the same amount. It keeps a component shared by all keys
+  out of the rounding and out of the gradients.
 
 ## Features
 

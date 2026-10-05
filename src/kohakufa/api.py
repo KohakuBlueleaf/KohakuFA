@@ -29,6 +29,30 @@ def _pad_head_dim(q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor, Tens
     return tuple(torch.nn.functional.pad(t, (0, padded - dim)) for t in (q, k, v))
 
 
+def _centered(k: Tensor, mean: Tensor, dtype: torch.dtype) -> Tensor:
+    """``k - mean`` in fp32, rounded once to ``dtype``."""
+    return (k.float() - mean).to(dtype)
+
+
+def _center_keys(k: Tensor, dtype: torch.dtype) -> Tensor:
+    """Key smoothing (SageBwd): subtract the fp32 mean over keys of each (batch, K / V head).
+    Exact: every logit of a query row moves by the same ``scale q . mean``, which the
+    softmax drops (masks included: the shift is shared by all keys), and dK picks up
+    ``- mean(dK')`` through autograd. It removes the component all keys share, so neither
+    the rounding to ``dtype`` nor the backward's ``dQ = scale dS K`` carries it."""
+    return _centered(k, k.float().mean(-2, keepdim=True), dtype)
+
+
+def _center_keys_varlen(k: Tensor, cu_seqlens_k: Tensor) -> Tensor:
+    """``_center_keys`` per packed sequence (``k [Tk, Hkv, D]``), without host syncs."""
+    rows = torch.arange(k.shape[0], device=k.device)
+    seq = torch.searchsorted(cu_seqlens_k[1:], rows, right=True)
+    k32 = k.float()
+    sums = k32.new_zeros(cu_seqlens_k.numel() - 1, *k.shape[1:]).index_add_(0, seq, k32)
+    counts = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).clamp(min=1).float()
+    return _centered(k, (sums / counts[:, None, None])[seq], k.dtype)
+
+
 def attention(
     q: Tensor,
     k: Tensor,
@@ -39,6 +63,7 @@ def attention(
     scale: float | None = None,
     mask: Tensor | None = None,
     compute_dtype: torch.dtype | None = None,
+    center_keys: bool = False,
 ) -> Tensor:
     """``softmax(scale q k^T) v``.
 
@@ -57,6 +82,10 @@ def attention(
             sees no key outputs 0 and gets zero gradients.
         compute_dtype: tensor-core operand dtype; inputs of another dtype (e.g. fp32)
             are cast. Defaults to the inputs' dtype if it is one, else fp16.
+        center_keys: subtract the mean key (over keys, per batch and K / V head, in
+            fp32) before the single cast to ``compute_dtype``. Exact (softmax is
+            shift-invariant per row); keeps a component shared by all keys out of the
+            rounding and out of the gradients' accumulated error.
 
     Returns ``[B, H, Sq, D]`` in the inputs' dtype (a view of ``[B, Sq, H, D]``
     storage, so ``out.transpose(1, 2).flatten(2)`` is free).
@@ -69,6 +98,8 @@ def attention(
     if compute_dtype not in COMPUTE_DTYPES:
         raise TypeError(f"compute_dtype {compute_dtype}: one of {COMPUTE_DTYPES}")
     in_dtype = q.dtype
+    if center_keys:
+        k = _center_keys(k, compute_dtype)
     q, k, v = (t.to(compute_dtype) for t in (q, k, v))
     dim = q.shape[-1]
     if scale is None:
@@ -91,19 +122,23 @@ def attention_varlen(
     block_causal: int = 0,
     scale: float | None = None,
     plan: tuple | None = None,
+    center_keys: bool = False,
 ) -> Tensor:
     """Variable-length attention over packed sequences, each its own problem (no padding
     computed): ``q [Tq, H, D]``, ``k / v [Tk, Hkv, D]`` (fp16 / bf16), sequence ``b`` at
     rows ``cu_seqlens[b] : cu_seqlens[b + 1]`` (int32 [B + 1]). ``causal`` /
     ``block_causal`` apply within each sequence. ``plan``: ``varlen_plan(cu_seqlens_q,
     cu_seqlens_k, H, Hkv, block)``, built once per batch of lengths (it reads the lengths
-    on the host), e.g. to keep the call free of host syncs inside a CUDA graph."""
+    on the host), e.g. to keep the call free of host syncs inside a CUDA graph.
+    ``center_keys``: as in ``attention``, with the mean taken per sequence."""
     if causal and block_causal not in (0, 1):
         raise ValueError("causal is block_causal=1: give one of them")
     block = 1 if causal else int(block_causal)
     dim = q.shape[-1]
     if scale is None:
         scale = dim**-0.5
+    if center_keys:
+        k = _center_keys_varlen(k, cu_seqlens_k)
     q, k, v = _pad_head_dim(q, k, v)
     out = _sm100_attention_varlen(
         q, k, v, cu_seqlens_q, cu_seqlens_k, scale=scale, block_causal=block, plan=plan

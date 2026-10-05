@@ -281,11 +281,15 @@ def packed(lengths, heads, kv_heads, dtype=torch.float16, seed=4, dim=64):
     return make(heads), make(kv_heads), make(kv_heads), dout, cu
 
 
-def check_varlen(lengths, heads, kv_heads, block, dtype=torch.float16, tol=TOL, dim=64):
+def check_varlen(
+    lengths, heads, kv_heads, block, dtype=torch.float16, tol=TOL, dim=64, center_keys=False
+):
     from kohakufa import attention_varlen
 
     q, k, v, dout, cu = packed(lengths, heads, kv_heads, dtype, dim=dim)
-    out = attention_varlen(q, k, v, cu, cu, block_causal=block)
+    if center_keys:  # one key direction shared by every token, 4x the key norm
+        k = shared_offset(k.detach(), 4.0).requires_grad_()
+    out = attention_varlen(q, k, v, cu, cu, block_causal=block, center_keys=center_keys)
     out.backward(dout)
     for b in range(len(lengths)):
         s, e = int(cu[b]), int(cu[b + 1])
@@ -413,3 +417,27 @@ def test_wide_heads_huge_logits():
     want = reference(q, k, v, dout, 128**-0.5, block=1)
     for name, g, w, bound in zip(("dk", "dv"), got[2:], want[2:], (0.995, 0.9999)):
         assert metrics(g, w)["cos"] > bound, name
+
+
+def shared_offset(k, size, seed=7):
+    """``k`` plus one direction shared by every key, ``size`` times the mean key norm (the
+    component key centering removes)."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    direction = torch.randn(k.shape[-1], device="cuda", generator=gen)
+    norm = k.float().norm(dim=-1).mean()
+    return (k.float() + size * norm * direction / direction.norm()).to(k.dtype)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_center_keys(causal):
+    """``center_keys`` is exact: against fp64 attention on the UNcentered keys (a shared key
+    offset shifts every logit of a row by the same amount; dK picks up ``- mean(dK')``)."""
+    q, k, v, dout = inputs(2, 3, 300, 300)
+    k = shared_offset(k.detach(), 4.0).requires_grad_()
+    want = reference(q, k, v, dout, 64**-0.5, block=1 if causal else 0)
+    check(run(q, k, v, dout, causal=causal, center_keys=True), want)
+
+
+def test_center_keys_varlen():
+    """Per-sequence key means for packed sequences."""
+    check_varlen([5, 300, 129, 700], 4, 2, 0, center_keys=True)
